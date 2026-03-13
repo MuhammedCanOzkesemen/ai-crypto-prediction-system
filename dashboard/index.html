@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Crypto Forecasting Dashboard</title>
+  <link rel="stylesheet" href="/dashboard/static/style.css">
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+</head>
+<body>
+  <header class="header">
+    <h1>Crypto Forecasting Dashboard</h1>
+    <p class="subtitle">14-day ensemble predictions from RandomForest, XGBoost, LightGBM</p>
+  </header>
+
+  <main class="main">
+    <section class="controls">
+      <label for="coin-select">Coin</label>
+      <select id="coin-select">
+        <option value="">Select coin…</option>
+      </select>
+      <button id="fetch-btn" type="button" disabled>Load data</button>
+      <label class="ctrl-auto-refresh">
+        <input type="checkbox" id="auto-refresh-toggle" checked>
+        Auto-refresh
+      </label>
+      <label class="ctrl-interval">
+        <span>Interval (s)</span>
+        <input type="number" id="refresh-interval" value="60" min="15" max="600" step="15">
+      </label>
+    </section>
+
+    <section id="loading" class="loading hidden">Loading…</section>
+
+    <section id="prediction" class="card prediction-section hidden">
+      <h2>Forecast overview</h2>
+      <div class="pred-grid">
+        <div class="pred-item">
+          <span class="label">Coin</span>
+          <span id="pred-coin" class="value">—</span>
+        </div>
+        <div class="pred-item">
+          <span class="label">Current price</span>
+          <span id="pred-current" class="value">—</span>
+        </div>
+        <div class="pred-item">
+          <span class="label">Final day forecast</span>
+          <span id="pred-avg" class="value">—</span>
+        </div>
+        <div class="pred-item">
+          <span class="label">Forecast range</span>
+          <span id="pred-bounds" class="value">—</span>
+        </div>
+        <div class="pred-item">
+          <span class="label">Model agreement</span>
+          <span id="pred-agreement" class="value">—</span>
+        </div>
+        <div class="pred-item">
+          <span class="label">Horizon</span>
+          <span id="pred-horizon" class="value">—</span>
+        </div>
+        <div class="pred-item">
+          <span class="label">Forecast period</span>
+          <span id="pred-forecast-period" class="value">—</span>
+        </div>
+        <div class="pred-item">
+          <span class="label">Latest market data</span>
+          <span id="pred-market-ts" class="value">—</span>
+        </div>
+        <div class="pred-item">
+          <span class="label">Generated</span>
+          <span id="pred-generated" class="value">—</span>
+        </div>
+        <div class="pred-item pred-item-freshness">
+          <span class="label">Data freshness</span>
+          <span id="pred-freshness" class="value freshness-value">—</span>
+          <span id="pred-freshness-msg" class="freshness-msg hidden"></span>
+        </div>
+      </div>
+      <div class="model-predictions">
+        <h3>Per-model forecasts</h3>
+        <ul id="pred-models"></ul>
+      </div>
+    </section>
+
+    <section id="chart-section" class="card chart-section hidden">
+      <h2>Historical &amp; 14-day forecast</h2>
+      <div id="chart" class="chart-container"></div>
+    </section>
+
+    <section id="forecast-table-section" class="card forecast-table-section hidden">
+      <h2>14-day forecast path</h2>
+      <div class="table-wrapper">
+        <table id="forecast-table" class="forecast-table">
+          <thead>
+            <tr>
+              <th>Day</th>
+              <th>Date</th>
+              <th>Forecast</th>
+              <th>Lower</th>
+              <th>Upper</th>
+              <th>Agreement</th>
+            </tr>
+          </thead>
+          <tbody id="forecast-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="evaluation-section" class="card evaluation-section hidden">
+      <h2>Evaluation summary</h2>
+      <p id="eval-best" class="eval-best">—</p>
+      <div id="eval-metrics" class="eval-metrics hidden"></div>
+    </section>
+
+    <section id="error" class="error hidden"></section>
+  </main>
+
+  <script src="/dashboard/static/app.js"></script>
+</body>
+</html>

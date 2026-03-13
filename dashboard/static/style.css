@@ -1,0 +1,305 @@
+/* Crypto Forecasting Dashboard – professional, product-like styling */
+
+:root {
+  --bg: #0f1117;
+  --bg-card: #161b22;
+  --bg-input: #21262d;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --accent: #58a6ff;
+  --accent-hover: #79b8ff;
+  --success: #3fb950;
+  --error: #f85149;
+  --radius: 6px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--text);
+  background: var(--bg);
+  min-height: 100vh;
+}
+
+.header {
+  padding: 1.5rem 1.5rem 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+.subtitle {
+  margin: 0.25rem 0 0;
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
+.main {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 1.5rem;
+}
+
+.controls label {
+  color: var(--text-muted);
+}
+
+.controls select {
+  padding: 0.4rem 0.6rem;
+  font-size: 0.9rem;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  min-width: 140px;
+}
+
+.controls select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.controls button {
+  padding: 0.4rem 0.9rem;
+  font-size: 0.9rem;
+  color: var(--text);
+  background: var(--accent);
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.controls button:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.controls button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ctrl-auto-refresh {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.ctrl-auto-refresh input {
+  cursor: pointer;
+}
+
+.ctrl-interval {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.ctrl-interval input {
+  width: 4rem;
+  padding: 0.25rem 0.4rem;
+  font-size: 0.85rem;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.loading {
+  color: var(--text-muted);
+  padding: 1rem 0;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  margin-bottom: 1.25rem;
+}
+
+.card h2 {
+  margin: 0 0 1rem;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.prediction-section .pred-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 0.75rem 1.5rem;
+}
+
+.pred-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.pred-item .label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.pred-item .value {
+  font-weight: 500;
+}
+
+.model-predictions {
+  margin-top: 1.25rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.model-predictions h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.model-predictions ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.model-predictions li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.25rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.model-predictions li:last-child {
+  border-bottom: none;
+}
+
+.chart-section .chart-container {
+  min-height: 320px;
+}
+
+.eval-best {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.eval-metrics {
+  margin-top: 0.75rem;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+  gap: 0.5rem;
+}
+
+.eval-metrics span {
+  display: block;
+  padding: 0.35rem 0.5rem;
+  background: var(--bg-input);
+  border-radius: 4px;
+  font-size: 0.8rem;
+}
+
+.eval-metrics span strong {
+  display: block;
+  font-size: 1rem;
+  color: var(--accent);
+}
+
+.error {
+  padding: 1rem;
+  background: rgba(248, 81, 73, 0.1);
+  border: 1px solid var(--error);
+  border-radius: var(--radius);
+  color: var(--error);
+}
+
+/* Forecast table */
+.table-wrapper {
+  overflow-x: auto;
+}
+
+.forecast-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.forecast-table th,
+.forecast-table td {
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.forecast-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.75rem;
+}
+
+.forecast-table tbody tr:hover {
+  background: rgba(88, 166, 255, 0.05);
+}
+
+.forecast-table .num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Forecast period & data freshness */
+.pred-item-freshness {
+  grid-column: 1 / -1;
+}
+
+.freshness-value {
+  text-transform: capitalize;
+}
+
+.freshness-value.freshness-fresh {
+  color: var(--success);
+}
+
+.freshness-value.freshness-stale {
+  color: #d29922;
+}
+
+.freshness-msg {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 0.25rem;
+}
+
+.freshness-msg:not(.hidden) {
+  display: block;
+}
