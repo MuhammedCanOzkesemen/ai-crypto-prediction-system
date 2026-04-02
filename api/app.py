@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from data.data_refresh import get_last_refresh_time, refresh_data_if_needed
 from prediction.predictor import Predictor
 from utils.config import settings
 from utils.constants import get_supported_coins_list
@@ -128,6 +129,10 @@ class ForecastPathResponse(BaseModel):
         None,
         description="Whole hours since latest_market_timestamp (UTC); None if unknown",
     )
+    last_refresh_time: str | None = Field(
+        None,
+        description="ISO UTC timestamp of last successful data/feature refresh for this coin",
+    )
     forecast_path: list[ForecastDayItem]
     summary: ForecastPathSummary
     evaluation: dict | None = None
@@ -147,6 +152,14 @@ class ForecastPathResponse(BaseModel):
         le=1.0,
         description="Model agreement on final horizon day (day 14)",
     )
+
+
+class RefreshResponse(BaseModel):
+    """Result of POST /api/refresh/{coin}."""
+    coin: str
+    refreshed: bool = Field(..., description="True if fetch + feature rebuild ran successfully")
+    last_refresh_time: str | None = None
+    detail: str | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -245,14 +258,14 @@ def create_app() -> FastAPI:
         if match is None:
             raise HTTPException(status_code=404, detail=f"Unsupported coin: {coin}")
         features_dir = settings.training.features_dir
-        features_path = features_dir / f"{match.replace(' ', '_')}_features.parquet"
-        if not features_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail=f"Feature file not found for {match}. Run train_pipeline first.",
-            )
         path_result = predictor.forecast_path(match, features_dir=features_dir)
         if path_result is None:
+            features_path = features_dir / f"{match.replace(' ', '_')}_features.parquet"
+            if not features_path.exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Feature file not found for {match}. Run train_pipeline or POST /api/refresh/{match}.",
+                )
             raise HTTPException(
                 status_code=503,
                 detail=f"Forecast path not available for {match}. Retrain with train_pipeline to enable 14-day path.",
@@ -300,6 +313,7 @@ def create_app() -> FastAPI:
             data_freshness=freshness_status,
             data_freshness_message=freshness_message,
             data_age_hours=int(data_age_hours) if data_age_hours is not None else None,
+            last_refresh_time=path_result.get("last_refresh_time"),
             forecast_path=[ForecastDayItem(**d) for d in path_result["forecast_path"]],
             summary=ForecastPathSummary(**path_result["summary"]),
             evaluation=evaluation,
@@ -311,6 +325,25 @@ def create_app() -> FastAPI:
             multi_horizon=multi_horizon,
             mean_path_agreement=float(path_result.get("mean_path_agreement", 0.0)),
             model_agreement_score=float(path_result.get("model_agreement_score", 0.0)),
+        )
+
+    @api_router.post("/refresh/{coin}", response_model=RefreshResponse)
+    def force_refresh_coin(
+        coin: str = PathParam(..., description="Coin display name"),
+    ) -> RefreshResponse:
+        """Force OHLCV fetch and feature parquet rebuild for one coin."""
+        supported = get_supported_coins_list()
+        match = next((c for c in supported if c.lower() == coin.strip().lower()), None)
+        if match is None:
+            raise HTTPException(status_code=404, detail=f"Unsupported coin: {coin}")
+        features_dir = settings.training.features_dir
+        ok = refresh_data_if_needed(match, force=True, features_dir=features_dir)
+        ts = get_last_refresh_time(match) if ok else None
+        return RefreshResponse(
+            coin=match,
+            refreshed=ok,
+            last_refresh_time=ts,
+            detail=None if ok else "Refresh failed (fetch or feature build). Check logs.",
         )
 
     @api_router.get("/chart/{coin}")
@@ -402,14 +435,14 @@ def create_app() -> FastAPI:
                 detail=f"Unsupported coin: '{coin}'. Supported: {supported}",
             )
         features_dir = settings.training.features_dir
-        features_path = features_dir / f"{match.replace(' ', '_')}_features.parquet"
-        if not features_path.exists():
-            raise HTTPException(
-                status_code=404,
-                detail=f"Feature file not found for {match}. Run train_pipeline first.",
-            )
         result = predictor.predict_from_latest_features(match, features_dir=features_dir)
         if result is None:
+            features_path = features_dir / f"{match.replace(' ', '_')}_features.parquet"
+            if not features_path.exists():
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Feature file not found for {match}. Run train_pipeline or POST /api/refresh/{match}.",
+                )
             models_dir = settings.training.models_dir
             coin_models = models_dir / match.replace(" ", "_")
             if not coin_models.exists():

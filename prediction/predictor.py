@@ -38,6 +38,7 @@ from prediction.prediction_state import (
     load_last_trend_score,
     save_state,
 )
+from data.data_refresh import get_last_refresh_time, refresh_data_if_needed
 from utils.config import settings
 from utils.logging_setup import get_logger
 
@@ -311,6 +312,7 @@ class Predictor:
         Returns prediction dict (possibly with _path for multi-output) or None.
         """
         features_dir = Path(features_dir) if features_dir else settings.training.features_dir
+        refresh_data_if_needed(coin, features_dir=features_dir)
         path = features_dir / f"{coin.replace(' ', '_')}_features.parquet"
         if not path.exists():
             logger.warning("Feature file not found: %s", path)
@@ -508,4 +510,5 @@ class Predictor:
             "data_freshness": data_freshness,
             "data_age_hours": data_age_hours,
             "data_freshness_detail": combined_msg,
+            "last_refresh_time": get_last_refresh_time(coin),
         }
