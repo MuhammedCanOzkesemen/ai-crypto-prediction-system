@@ -16,6 +16,7 @@ import pandas as pd
 
 from features.feature_builder import get_feature_columns, TARGET_PRICE_COLUMNS
 from models.model_registry import get_model, list_models
+from prediction.ensemble_weights import compute_weights_from_metrics, persist_ensemble_weights
 from utils.config import settings
 from utils.constants import get_supported_coins_list
 from utils.logging_setup import get_logger, configure_root_logger
@@ -189,6 +190,8 @@ def run_evaluation(
                 with open(out_path, "w") as f:
                     json.dump(metrics, f, indent=2)
                 logger.info("Saved metrics for %s to %s", coin, out_path)
+                w = compute_weights_from_metrics(list(metrics.keys()), metrics)
+                persist_ensemble_weights(coin, w, eval_dir)
             except OSError as e:
                 logger.exception("Failed to save metrics for %s: %s", coin, e)
 

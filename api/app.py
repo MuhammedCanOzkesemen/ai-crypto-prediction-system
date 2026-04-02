@@ -74,12 +74,27 @@ class ForecastPathSummary(BaseModel):
     max_forecast_price: float
     average_forecast_price: float
     trend_direction_14d: str
+    trend_label: str = Field(
+        "SIDEWAYS",
+        description="STRONG UP | UP | SIDEWAYS | DOWN | STRONG DOWN",
+    )
+
+
+class HorizonSnapshot(BaseModel):
+    """Single-horizon slice (1d / 3d / 7d / 14d)."""
+    day_index: int
+    forecast_date: str | None = None
+    predicted_price: float
+    lower_bound: float | None = None
+    upper_bound: float | None = None
+    implied_return_vs_spot: float | None = None
+    agreement_score: float | None = None
 
 
 def _data_freshness(latest_market_ts: str | None) -> tuple[str, str | None]:
     """
-    Returns (status, message): ('fresh' | 'stale', optional warning).
-    Stale if market data is older than 36 hours (transparent, no fake freshness).
+    Fallback freshness if predictor did not attach fields.
+    Stale if market data is older than 24 hours (UTC).
     """
     if not latest_market_ts or not latest_market_ts.strip():
         return "stale", "Market data date unknown."
@@ -91,7 +106,7 @@ def _data_freshness(latest_market_ts: str | None) -> tuple[str, str | None]:
             ts = ts.tz_convert(timezone.utc)
         now = datetime.now(timezone.utc)
         age_hours = (now - ts).total_seconds() / 3600.0
-        if age_hours <= 36:
+        if age_hours <= 24.0:
             return "fresh", None
         return "stale", f"Underlying market data is {int(age_hours)} hours old. Refresh features for latest data."
     except Exception:
@@ -99,7 +114,7 @@ def _data_freshness(latest_market_ts: str | None) -> tuple[str, str | None]:
 
 
 class ForecastPathResponse(BaseModel):
-    """Full 14-day forecast path with summary."""
+    """Full 14-day forecast path with summary and intelligence layer."""
     coin: str
     current_price: float
     horizon_days: int
@@ -109,9 +124,29 @@ class ForecastPathResponse(BaseModel):
     forecast_period_end: str | None = None
     data_freshness: str = "unknown"
     data_freshness_message: str | None = None
+    data_age_hours: int | None = Field(
+        None,
+        description="Whole hours since latest_market_timestamp (UTC); None if unknown",
+    )
     forecast_path: list[ForecastDayItem]
     summary: ForecastPathSummary
     evaluation: dict | None = None
+    confidence_score: float = Field(0.0, ge=0.0, le=0.85, description="Composite AI confidence (capped)")
+    trend_label: str = Field("SIDEWAYS", description="Classified trend vs spot and volatility")
+    explanation: str = Field("", description="Human-readable forecast rationale")
+    model_weights: dict[str, float] = Field(default_factory=dict, description="Metric-weighted ensemble weights")
+    volatility_level: str = Field("UNKNOWN", description="LOW | MEDIUM | HIGH | UNKNOWN")
+    multi_horizon: dict[str, HorizonSnapshot] = Field(
+        default_factory=dict,
+        description="Snapshots at 1d, 3d, 7d, 14d",
+    )
+    mean_path_agreement: float = Field(0.0, ge=0.0, le=1.0, description="Mean daily model agreement")
+    model_agreement_score: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Model agreement on final horizon day (day 14)",
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -224,7 +259,15 @@ def create_app() -> FastAPI:
             )
         now = datetime.now(timezone.utc).isoformat()
         latest_ts = path_result.get("latest_market_timestamp")
-        freshness_status, freshness_message = _data_freshness(latest_ts)
+        freshness_status = str(path_result.get("data_freshness") or "unknown")
+        data_age_hours = path_result.get("data_age_hours")
+        freshness_message = path_result.get("data_freshness_detail")
+        if freshness_status not in ("fresh", "stale") or freshness_message is None:
+            fb_status, fb_msg = _data_freshness(latest_ts)
+            if freshness_status not in ("fresh", "stale"):
+                freshness_status = fb_status
+            if freshness_message is None:
+                freshness_message = fb_msg
         eval_path = EVALUATION_DIR / f"{match.replace(' ', '_')}_metrics.json"
         evaluation = None
         if eval_path.exists():
@@ -240,6 +283,12 @@ def create_app() -> FastAPI:
                 }
             except Exception:
                 pass
+        mh_raw = path_result.get("multi_horizon") or {}
+        multi_horizon: dict[str, HorizonSnapshot] = {}
+        for key, snap in mh_raw.items():
+            if isinstance(snap, dict):
+                multi_horizon[str(key)] = HorizonSnapshot(**snap)
+
         return ForecastPathResponse(
             coin=path_result["coin"],
             current_price=path_result["current_price"],
@@ -250,9 +299,18 @@ def create_app() -> FastAPI:
             forecast_period_end=path_result.get("forecast_period_end"),
             data_freshness=freshness_status,
             data_freshness_message=freshness_message,
+            data_age_hours=int(data_age_hours) if data_age_hours is not None else None,
             forecast_path=[ForecastDayItem(**d) for d in path_result["forecast_path"]],
             summary=ForecastPathSummary(**path_result["summary"]),
             evaluation=evaluation,
+            confidence_score=float(path_result.get("confidence_score", 0.0)),
+            trend_label=str(path_result.get("trend_label", "SIDEWAYS")),
+            explanation=str(path_result.get("explanation", "")),
+            model_weights=dict(path_result.get("model_weights") or {}),
+            volatility_level=str(path_result.get("volatility_level", "UNKNOWN")),
+            multi_horizon=multi_horizon,
+            mean_path_agreement=float(path_result.get("mean_path_agreement", 0.0)),
+            model_agreement_score=float(path_result.get("model_agreement_score", 0.0)),
         )
 
     @api_router.get("/chart/{coin}")

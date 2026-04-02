@@ -10,7 +10,7 @@
 <body>
   <header class="header">
     <h1>Crypto Forecasting Dashboard</h1>
-    <p class="subtitle">14-day ensemble predictions from RandomForest, XGBoost, LightGBM</p>
+    <p class="subtitle">Production AI forecasts — weighted ensemble, confidence, and explainability</p>
   </header>
 
   <main class="main">
@@ -76,10 +76,43 @@
           <span id="pred-freshness" class="value freshness-value">—</span>
           <span id="pred-freshness-msg" class="freshness-msg hidden"></span>
         </div>
+        <div class="pred-item pred-item-wide">
+          <span class="label">AI confidence</span>
+          <div class="confidence-wrap">
+            <span id="pred-confidence-pct" class="value">—</span>
+            <div class="confidence-bar-bg" aria-hidden="true">
+              <div id="pred-confidence-fill" class="confidence-bar-fill"></div>
+            </div>
+          </div>
+        </div>
+        <div class="pred-item">
+          <span class="label">Trend (14d)</span>
+          <span id="pred-trend" class="value trend-value">—</span>
+        </div>
+        <div class="pred-item">
+          <span class="label">Volatility regime</span>
+          <span id="pred-volatility" class="value">—</span>
+        </div>
+        <div class="pred-item pred-item-wide">
+          <span class="label">Mean path agreement</span>
+          <span id="pred-mean-agreement" class="value">—</span>
+        </div>
+      </div>
+      <div id="pred-explanation-block" class="explanation-block hidden">
+        <h3>Why this forecast</h3>
+        <p id="pred-explanation" class="explanation-text"></p>
+      </div>
+      <div id="pred-multi-horizon-block" class="multi-horizon-block hidden">
+        <h3>Multi-horizon</h3>
+        <div class="horizon-chips" id="pred-multi-horizon"></div>
       </div>
       <div class="model-predictions">
-        <h3>Per-model forecasts</h3>
+        <h3>Per-model forecasts (day 14)</h3>
         <ul id="pred-models"></ul>
+      </div>
+      <div class="model-weights-block">
+        <h3>Ensemble weights <span class="hint">(from inverse test MAE)</span></h3>
+        <ul id="pred-weights" class="weights-list"></ul>
       </div>
     </section>
 

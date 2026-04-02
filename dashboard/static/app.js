@@ -78,6 +78,41 @@
     return n.toFixed(2) + '%';
   }
 
+  function trendDisplay(trendLabel) {
+    var label = (trendLabel || '').toString().trim().toUpperCase();
+    var arrows = {
+      'STRONG UP': '↑↑',
+      'UP': '↑',
+      'SIDEWAYS': '→',
+      'DOWN': '↓',
+      'STRONG DOWN': '↓↓',
+    };
+    var arrow = arrows[label] || '→';
+    var cls = 'trend-sideways';
+    if (label === 'STRONG UP') cls = 'trend-strong-up';
+    else if (label === 'UP') cls = 'trend-up';
+    else if (label === 'SIDEWAYS') cls = 'trend-sideways';
+    else if (label === 'DOWN') cls = 'trend-down';
+    else if (label === 'STRONG DOWN') cls = 'trend-strong-down';
+    return { text: arrow + ' ' + (trendLabel || '—'), className: cls };
+  }
+
+  function setConfidenceUI(score) {
+    var pctEl = document.getElementById('pred-confidence-pct');
+    var fillEl = document.getElementById('pred-confidence-fill');
+    if (!pctEl || !fillEl) return;
+    if (typeof score !== 'number' || isNaN(score)) {
+      pctEl.textContent = '—';
+      fillEl.style.width = '0%';
+      fillEl.className = 'confidence-bar-fill';
+      return;
+    }
+    var p = Math.max(0, Math.min(1, score)) * 100;
+    pctEl.textContent = p.toFixed(1) + '%';
+    fillEl.style.width = p + '%';
+    fillEl.className = 'confidence-bar-fill ' + (p >= 66 ? 'conf-high' : p >= 40 ? 'conf-mid' : 'conf-low');
+  }
+
   /** Plotly y-axis tickformat for adaptive scaling (micro-prices) */
   function chartTickFormat(refPrice) {
     if (refPrice == null || refPrice <= 0) return '$.4f';
@@ -118,9 +153,9 @@
     document.getElementById('pred-agreement').textContent =
       typeof data.model_agreement_score === 'number'
         ? formatPercent(data.model_agreement_score * 100)
-        : (data.forecast_path && data.forecast_path.length
-            ? formatPercent((data.forecast_path[data.forecast_path.length - 1].agreement_score || 0) * 100)
-            : '—');
+        : data.forecast_path && data.forecast_path.length
+          ? formatPercent((data.forecast_path[data.forecast_path.length - 1].agreement_score || 0) * 100)
+          : '—';
     document.getElementById('pred-horizon').textContent =
       (data.horizon_days != null ? data.horizon_days : 14) + ' days';
     var periodStart = data.forecast_period_start;
@@ -136,13 +171,110 @@
     var freshnessMsgEl = document.getElementById('pred-freshness-msg');
     if (freshnessEl) {
       var freshness = (data.data_freshness || 'unknown').toLowerCase();
-      freshnessEl.textContent = freshness === 'fresh' || freshness === 'stale' ? freshness : '—';
+      var ageH = data.data_age_hours;
+      var label = freshness === 'fresh' || freshness === 'stale' ? freshness : '—';
+      if ((freshness === 'fresh' || freshness === 'stale') && typeof ageH === 'number') {
+        label += ' (' + ageH + 'h)';
+      }
+      freshnessEl.textContent = label;
       freshnessEl.className = 'value freshness-value' + (freshness === 'fresh' ? ' freshness-fresh' : freshness === 'stale' ? ' freshness-stale' : '');
     }
     if (freshnessMsgEl) {
-      var msg = data.data_freshness_message || '';
+      var msg = data.data_freshness_message || data.data_freshness_detail || '';
       freshnessMsgEl.textContent = msg;
       freshnessMsgEl.classList.toggle('hidden', !msg);
+    }
+
+    setConfidenceUI(data.confidence_score);
+
+    var trendEl = document.getElementById('pred-trend');
+    if (trendEl) {
+      var tl = data.trend_label || (data.summary && data.summary.trend_label);
+      var td = trendDisplay(tl || '');
+      trendEl.textContent = td.text;
+      trendEl.className = 'value trend-value ' + td.className;
+    }
+
+    var volEl = document.getElementById('pred-volatility');
+    if (volEl) {
+      volEl.textContent = data.volatility_level || '—';
+    }
+
+    var meanAgEl = document.getElementById('pred-mean-agreement');
+    if (meanAgEl) {
+      meanAgEl.textContent =
+        typeof data.mean_path_agreement === 'number'
+          ? formatPercent(data.mean_path_agreement * 100)
+          : '—';
+    }
+
+    var explBlock = document.getElementById('pred-explanation-block');
+    var explEl = document.getElementById('pred-explanation');
+    if (explBlock && explEl) {
+      var ex = (data.explanation || '').trim();
+      explEl.textContent = ex;
+      explBlock.classList.toggle('hidden', !ex);
+    }
+
+    var mhBlock = document.getElementById('pred-multi-horizon-block');
+    var mhEl = document.getElementById('pred-multi-horizon');
+    if (mhBlock && mhEl) {
+      mhEl.innerHTML = '';
+      var mh = data.multi_horizon;
+      var keys = mh && typeof mh === 'object' ? Object.keys(mh) : [];
+      if (keys.length) {
+        keys.forEach(function (k) {
+          var s = mh[k];
+          if (!s) return;
+          var chip = document.createElement('span');
+          chip.className = 'horizon-chip';
+          var price = s.predicted_price;
+          var ret = s.implied_return_vs_spot;
+          var retStr =
+            typeof ret === 'number'
+              ? ' (' + (ret >= 0 ? '+' : '') + (ret * 100).toFixed(2) + '% vs spot)'
+              : '';
+          chip.innerHTML =
+            '<strong>' +
+            k +
+            '</strong> ' +
+            formatPrice(price, refPrice) +
+            retStr;
+          mhEl.appendChild(chip);
+        });
+        mhBlock.classList.remove('hidden');
+      } else {
+        mhBlock.classList.add('hidden');
+      }
+    }
+
+    var wUl = document.getElementById('pred-weights');
+    if (wUl) {
+      wUl.innerHTML = '';
+      var mw = data.model_weights && typeof data.model_weights === 'object' ? data.model_weights : {};
+      var wkeys = Object.keys(mw);
+      var wmax = 0;
+      wkeys.forEach(function (k) {
+        if (mw[k] > wmax) wmax = mw[k];
+      });
+      wkeys
+        .sort(function (a, b) {
+          return (mw[b] || 0) - (mw[a] || 0);
+        })
+        .forEach(function (model) {
+          var w = mw[model];
+          var li = document.createElement('li');
+          var pct = wmax > 0 ? Math.round((w / wmax) * 100) : 0;
+          li.innerHTML =
+            '<span>' +
+            model.replace(/_/g, ' ') +
+            '</span><span class="w-bar-wrap"><span class="w-bar" style="width:' +
+            pct +
+            '%"></span></span><span>' +
+            (typeof w === 'number' ? (w * 100).toFixed(1) + '%' : '—') +
+            '</span>';
+          wUl.appendChild(li);
+        });
     }
 
     const ul = document.getElementById('pred-models');
