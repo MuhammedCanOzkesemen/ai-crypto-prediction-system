@@ -53,6 +53,10 @@ from features.feature_builder import (
     get_feature_columns,
 )
 from features.schema import FEATURE_SCHEMA_VERSION, official_schema_documentation
+from models.feature_subsets import indices_dict_for_metadata, per_model_feature_lists
+
+# XGBoost: train on recent history only so it chases regime shifts; RF/LGBM use full train split.
+XGBOOST_RECENT_TRAIN_FRACTION = 0.58
 from models.model_registry import get_model, list_models
 from prediction.inference_utils import save_scaler_bundle
 from evaluation.model_evaluator import run_evaluation
@@ -93,7 +97,7 @@ def run_data_and_features(
             results[coin] = {"price_df": None, "feature_df": None}
             failed.append(coin)
             continue
-        feature_df = build_features(price_df, include_targets=True)
+        feature_df = build_features(price_df, include_targets=True, coin=coin)
         if feature_df.empty:
             logger.warning("No features for %s; skipping.", coin)
             results[coin] = {"price_df": price_df, "feature_df": None}
@@ -226,10 +230,8 @@ def run_train_models(
                 coin_dir / "feature_scaler.joblib",
                 slug,
             )
-            meta = _build_training_metadata(df, feat_order)
+            meta_base = _build_training_metadata(df, feat_order)
             meta_path = coin_dir / "training_metadata.json"
-            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-            logger.info("Saved training_metadata.json for %s", coin)
         except Exception as e:
             logger.exception("Failed to save scaler for %s: %s", coin, e)
             continue
@@ -253,17 +255,45 @@ def run_train_models(
         except Exception as e:
             logger.warning("Directional classifier not trained for %s: %s", coin, e)
 
+        pm_cols = per_model_feature_lists(model_names, feat_order)
+        per_model_idx = indices_dict_for_metadata(pm_cols, feat_order)
+
         trained[coin] = []
         for name in model_names:
             try:
+                idx = per_model_idx.get(name)
+                if not idx:
+                    idx = list(range(len(feat_order)))
+                n_tr = len(y_train)
+                if str(name).lower() == "xgboost":
+                    i0 = max(0, int(n_tr * (1.0 - XGBOOST_RECENT_TRAIN_FRACTION)))
+                    row_sl = slice(i0, None)
+                else:
+                    row_sl = slice(None, None)
+                X_fit = X_train_s[row_sl, :][:, np.array(idx, dtype=np.int64)]
+                y_fit = y_train[row_sl]
                 model = get_model(name)
-                model.fit(X_train_s, y_train)
+                model.fit(X_fit, y_fit)
                 save_path = coin_dir / f"{name}.joblib"
                 model.save(save_path)
                 trained[coin].append(name)
-                logger.info("Trained %s for %s", name, coin)
+                logger.info("Trained %s for %s on %d/%d features", name, coin, len(idx), len(feat_order))
             except Exception as e:
                 logger.exception("Failed to train %s for %s: %s", name, coin, e)
+
+        try:
+            meta = dict(meta_base)
+            meta["per_model_feature_indices"] = per_model_idx
+            meta["ensemble_scaler_n_features"] = len(feat_order)
+            meta["per_model_train_window"] = {
+                "random_forest": "full_train_split",
+                "lightgbm": "full_train_split",
+                "xgboost": f"last_{int(XGBOOST_RECENT_TRAIN_FRACTION * 100)}pct_train_rows",
+            }
+            meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            logger.info("Saved training_metadata.json for %s (per-model feature subsets)", coin)
+        except Exception as e:
+            logger.exception("Failed to write training_metadata.json for %s: %s", coin, e)
     return trained
 
 

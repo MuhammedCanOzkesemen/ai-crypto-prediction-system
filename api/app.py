@@ -58,9 +58,17 @@ class CoinPredictionResponse(BaseModel):
     fallback_mode: bool = True
     forecast_validity: str = Field("questionable", description="invalid | questionable | valid")
     forecast_quality_score: float = Field(0.0, ge=0.0, le=1.0)
-    confidence_score: float = Field(0.0, ge=0.0, le=1.0, description="Path-level financial confidence")
+    confidence_score: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Trade-aware confidence (prediction quality × decision reliability)",
+    )
     confidence_composition_reference: str = Field("", description="How confidence_score is composed")
-    high_conviction: bool = Field(False, description="Strong trend + momentum + model agreement (+ classifier)")
+    high_conviction: bool = Field(
+        False,
+        description="High confidence, agreement, signal strength, classifier aligned, vol not HIGH",
+    )
     signal_strength_score: float = Field(0.0, ge=0.0, le=1.0)
     directional_probabilities: dict[str, float] = Field(
         default_factory=dict,
@@ -73,6 +81,44 @@ class CoinPredictionResponse(BaseModel):
     is_constant_prediction: bool = False
     low_variance_warning: bool = False
     degraded_input: bool = False
+    trade_signal: str = Field("NO_TRADE", description="BUY | SELL | NO_TRADE (legacy decision layer)")
+    trade_decision: str = Field(
+        "NO_TRADE",
+        description="Strict engine: STRONG_BUY | WEAK_BUY | NO_TRADE",
+    )
+    trade_reasons: list[str] = Field(
+        default_factory=list,
+        description="Structured reasons for trade_decision tier",
+    )
+    edge_score: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Trade engine edge: conf × agreement × signal_strength (± modifiers)",
+    )
+    expected_move_pct: float = Field(0.0, ge=0.0)
+    expected_move_strength: str = Field("WEAK", description="WEAK | MODERATE | STRONG")
+    risk_reward_ratio: float = Field(0.0, ge=0.0)
+    trade_valid: bool = Field(False)
+    directional_alignment: bool = Field(False)
+    trend_consistency_score: float = Field(0.0, ge=0.0, le=1.0)
+    decision_threshold_scale: float = Field(1.0, ge=0.5, le=1.5)
+    recent_no_trade_fraction: float = Field(0.0, ge=0.0, le=1.0)
+    trade_missing_for_actionable: list[str] = Field(default_factory=list)
+    twitter_sentiment_used: bool = Field(
+        False,
+        description="True when tweet volume exceeded threshold and sentiment influenced confidence",
+    )
+    sentiment_alignment: float = Field(
+        0.0,
+        ge=-1.0,
+        le=1.0,
+        description="1 = sentiment agrees with forecast direction, -1 = conflict, 0 = neutral / N/A",
+    )
+    sentiment_confidence_contribution: float = Field(
+        0.0,
+        description="Additive change to raw financial confidence from sentiment (capped)",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -197,7 +243,12 @@ class ForecastPathResponse(BaseModel):
     forecast_path: list[ForecastDayItem]
     summary: ForecastPathSummary
     evaluation: dict | None = None
-    confidence_score: float = Field(0.0, ge=0.0, le=1.0, description="Composite confidence [0,1]")
+    confidence_score: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Trade-aware confidence (prediction quality × decision reliability)",
+    )
     trend_label: str = Field("NEUTRAL", description="Classified 14d trend vs spot (path-based)")
     explanation: str = Field("", description="Human-readable forecast rationale")
     model_weights: dict[str, float] = Field(default_factory=dict, description="Metric-weighted ensemble weights")
@@ -255,11 +306,52 @@ class ForecastPathResponse(BaseModel):
     degraded_input: bool = Field(False, description="High missing-feature fill or bad align")
     high_conviction: bool = Field(
         False,
-        description="Strong ADX/momentum aligned with forecast + agreement (+ classifier)",
+        description="High confidence, agreement, signal strength, classifier aligned, vol not HIGH",
     )
     signal_strength_score: float = Field(0.0, ge=0.0, le=1.0)
     directional_probabilities: dict[str, float] = Field(default_factory=dict)
     volatility_regime: str = Field("UNKNOWN", description="LOW | MEDIUM | HIGH | UNKNOWN")
+    trade_signal: str = Field("NO_TRADE", description="BUY | SELL | NO_TRADE (legacy decision filter)")
+    trade_decision: str = Field(
+        "NO_TRADE",
+        description="Strict engine: STRONG_BUY | WEAK_BUY | NO_TRADE",
+    )
+    trade_reasons: list[str] = Field(
+        default_factory=list,
+        description="Structured reasons for trade_decision tier",
+    )
+    edge_score: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Trade engine edge: conf × agreement × signal_strength (± modifiers)",
+    )
+    expected_move_pct: float = Field(0.0, ge=0.0, description="|final−spot|/spot")
+    expected_move_strength: str = Field("WEAK", description="WEAK | MODERATE | STRONG")
+    risk_reward_ratio: float = Field(0.0, ge=0.0, description="|predicted move| / (upper−lower)")
+    trade_valid: bool = Field(False, description="True only if filter allows BUY or SELL")
+    directional_alignment: bool = Field(
+        False,
+        description="14d trend sign matches forecast move and classifier agrees",
+    )
+    trend_consistency_score: float = Field(0.0, ge=0.0, le=1.0)
+    decision_threshold_scale: float = Field(1.0, ge=0.5, le=1.5)
+    recent_no_trade_fraction: float = Field(0.0, ge=0.0, le=1.0)
+    trade_missing_for_actionable: list[str] = Field(default_factory=list)
+    twitter_sentiment_used: bool = Field(
+        False,
+        description="True when tweet volume exceeded threshold and sentiment influenced confidence",
+    )
+    sentiment_alignment: float = Field(
+        0.0,
+        ge=-1.0,
+        le=1.0,
+        description="1 = sentiment agrees with forecast direction, -1 = conflict, 0 = neutral / N/A",
+    )
+    sentiment_confidence_contribution: float = Field(
+        0.0,
+        description="Additive change to raw financial confidence from sentiment (capped)",
+    )
 
 
 class RefreshResponse(BaseModel):
@@ -446,6 +538,30 @@ def create_app() -> FastAPI:
             signal_strength_score=float(path_result.get("signal_strength_score") or 0.0),
             directional_probabilities=dict(path_result.get("directional_probabilities") or {}),
             volatility_regime=str(path_result.get("volatility_regime") or "UNKNOWN"),
+            trade_signal=str(path_result.get("trade_signal") or "NO_TRADE"),
+            trade_decision=str(path_result.get("trade_decision", "NO_TRADE")),
+            trade_reasons=list(path_result.get("trade_reasons") or []),
+            edge_score=float(path_result.get("edge_score") or 0.0),
+            expected_move_pct=float(path_result.get("expected_move_pct") or 0.0),
+            expected_move_strength=str(path_result.get("expected_move_strength") or "WEAK"),
+            risk_reward_ratio=float(path_result.get("risk_reward_ratio") or 0.0),
+            trade_valid=bool(path_result.get("trade_valid", False)),
+            directional_alignment=bool(path_result.get("directional_alignment", False)),
+            trend_consistency_score=float(path_result.get("trend_consistency_score") or 0.0),
+            decision_threshold_scale=float(path_result.get("decision_threshold_scale") or 1.0),
+            recent_no_trade_fraction=float(path_result.get("recent_no_trade_fraction") or 0.0),
+            trade_missing_for_actionable=list(path_result.get("trade_missing_for_actionable") or []),
+            twitter_sentiment_used=bool(
+                (path_result.get("forecast_diagnostics") or {}).get("twitter_sentiment_used", False)
+            ),
+            sentiment_alignment=float(
+                (path_result.get("forecast_diagnostics") or {}).get("sentiment_alignment", 0.0)
+            ),
+            sentiment_confidence_contribution=float(
+                (path_result.get("forecast_diagnostics") or {}).get(
+                    "sentiment_confidence_contribution", 0.0
+                )
+            ),
         )
 
     @api_router.post("/refresh/{coin}", response_model=RefreshResponse)
@@ -599,10 +715,31 @@ def create_app() -> FastAPI:
                 "step0_raw_logret_by_model": diag.get("step0_raw_logret_by_model") or {},
                 "model_horizon_variance_raw": diag.get("model_horizon_variance_raw") or {},
                 "max_missing_feature_fill_ratio": float(diag.get("max_missing_feature_fill_ratio", 0.0)),
+                "twitter_sentiment_used": bool(diag.get("twitter_sentiment_used", False)),
+                "sentiment_alignment": float(diag.get("sentiment_alignment", 0.0)),
+                "sentiment_confidence_contribution": float(
+                    diag.get("sentiment_confidence_contribution", 0.0)
+                ),
             },
             is_constant_prediction=bool(diag.get("is_constant_prediction", False)),
             low_variance_warning=bool(diag.get("low_variance_warning", False)),
             degraded_input=bool(diag.get("degraded_input", False)),
+            trade_signal=str(diag.get("trade_signal") or "NO_TRADE"),
+            trade_decision=str(diag.get("trade_decision", "NO_TRADE")),
+            trade_reasons=list(diag.get("trade_reasons") or []),
+            edge_score=float(diag.get("edge_score") or 0.0),
+            expected_move_pct=float(diag.get("expected_move_pct") or 0.0),
+            expected_move_strength=str(diag.get("expected_move_strength") or "WEAK"),
+            risk_reward_ratio=float(diag.get("risk_reward_ratio") or 0.0),
+            trade_valid=bool(diag.get("trade_valid", False)),
+            directional_alignment=bool(diag.get("directional_alignment", False)),
+            trend_consistency_score=float(diag.get("trend_consistency_score") or 0.0),
+            decision_threshold_scale=float(diag.get("decision_threshold_scale") or 1.0),
+            recent_no_trade_fraction=float(diag.get("recent_no_trade_fraction") or 0.0),
+            trade_missing_for_actionable=list(diag.get("trade_missing_for_actionable") or []),
+            twitter_sentiment_used=bool(diag.get("twitter_sentiment_used", False)),
+            sentiment_alignment=float(diag.get("sentiment_alignment", 0.0)),
+            sentiment_confidence_contribution=float(diag.get("sentiment_confidence_contribution", 0.0)),
         )
 
     # Dashboard (defined before mount so it takes precedence)

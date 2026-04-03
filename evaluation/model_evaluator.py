@@ -16,7 +16,11 @@ import pandas as pd
 
 from features.feature_builder import TARGET_LOG_RETURN_1D, get_feature_columns
 from models.model_registry import get_model, list_models
-from prediction.inference_utils import load_scaler_bundle_from_disk
+from prediction.inference_utils import (
+    load_scaler_bundle_from_disk,
+    prediction_matrix_to_dataframe,
+    slice_scaled_X_for_model,
+)
 from prediction.ensemble_weights import compute_weights_from_metrics, persist_ensemble_weights
 from utils.config import settings
 from utils.constants import get_supported_coins_list
@@ -119,6 +123,16 @@ def evaluate_models(
     slug = coin.replace(" ", "_")
     coin_dir = models_dir / slug
     bundle = load_scaler_bundle_from_disk(coin_dir, slug)
+    saved_col_order = list(bundle.get("feature_columns") or [])
+    meta: dict = {}
+    meta_path = coin_dir / "training_metadata.json"
+    if meta_path.exists():
+        try:
+            import json
+
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
     scaler = bundle.get("scaler")
     if scaler is not None:
         try:
@@ -147,7 +161,11 @@ def evaluate_models(
         try:
             model = get_model(name)
             model.load(path)
-            y_pred = np.ravel(model.predict(X_test_s))
+            Xv, cnames = slice_scaled_X_for_model(X_test_s, name, meta, saved_col_order)
+            X_df = prediction_matrix_to_dataframe(
+                Xv, model_wrapper=model, training_feature_columns=cnames
+            )
+            y_pred = np.ravel(model.predict(X_df))
         except Exception as e:
             logger.exception("Failed to evaluate %s for %s: %s", name, coin, e)
             continue

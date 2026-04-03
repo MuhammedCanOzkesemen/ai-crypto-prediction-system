@@ -212,6 +212,39 @@
           : '—';
     }
 
+    var tsBlock = document.getElementById('trade-signal-block');
+    var tdBadge = document.getElementById('trade-decision-badge');
+    var teScore = document.getElementById('trade-edge-score');
+    var trList = document.getElementById('trade-reasons-list');
+    if (tsBlock && tdBadge && teScore && trList) {
+      var dec = data.trade_decision != null ? String(data.trade_decision) : 'NO_TRADE';
+      tdBadge.textContent = dec.replace(/_/g, ' ');
+      tdBadge.className =
+        'trade-decision-badge ' +
+        (dec === 'STRONG_BUY' ? 'td-strong' : dec === 'WEAK_BUY' ? 'td-weak' : 'td-none');
+      if (typeof data.edge_score === 'number' && !isNaN(data.edge_score)) {
+        var es = Math.max(0, Math.min(1, data.edge_score));
+        teScore.textContent = es.toFixed(3) + ' (' + (es * 100).toFixed(1) + '% scale)';
+      } else {
+        teScore.textContent = '—';
+      }
+      trList.innerHTML = '';
+      var reasons = data.trade_reasons;
+      if (reasons && reasons.length) {
+        reasons.forEach(function (r) {
+          var li = document.createElement('li');
+          li.textContent = r;
+          trList.appendChild(li);
+        });
+      } else {
+        var li0 = document.createElement('li');
+        li0.className = 'trade-reason-muted';
+        li0.textContent = 'No supplemental reasons.';
+        trList.appendChild(li0);
+      }
+      tsBlock.classList.remove('hidden');
+    }
+
     var qStrip = document.getElementById('pred-quality-strip');
     if (qStrip) {
       var am = data.artifact_mode || '—';

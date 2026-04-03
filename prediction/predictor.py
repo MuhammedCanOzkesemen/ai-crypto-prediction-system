@@ -20,14 +20,16 @@ from data.data_refresh import get_last_refresh_time, refresh_data_if_needed
 from features.feature_builder import build_features, get_feature_columns
 from models.model_registry import get_model, list_models
 from prediction.ensemble_weights import compute_weights_from_metrics, load_evaluation_metrics
+from prediction.decision_layer import compute_decision_bundle, format_trade_decision_explanation
+from prediction.trade_filter import evaluate_trade_opportunity
 from prediction.forecast_intel import (
     apply_confidence_penalty_caps,
+    blend_signal_strength_with_twitter,
     build_multi_horizon,
     build_prediction_explanation,
     classify_trend_from_forecast_path,
     classify_volatility_level,
     compute_financial_confidence,
-    compute_high_conviction,
     compute_signal_strength_score,
     finalize_forecast_confidence,
     infer_volatility_regime_from_context,
@@ -324,6 +326,22 @@ class Predictor:
             "trend_strength_adx",
             "momentum_logret_7d",
             "close",
+            "trend_consistency_score",
+            "breakout_above_20d_high",
+            "breakout_below_20d_low",
+            "vol_expansion_score",
+            "vol_expansion_ratio",
+            "compression_expansion_score",
+            "breakout_above_14d_high",
+            "breakout_below_14d_low",
+            "dist_to_roll_high_14",
+            "dist_to_roll_low_14",
+            "ema_slope_accel",
+            "momentum_change_rate",
+            "twitter_sentiment",
+            "twitter_sentiment_7d_avg",
+            "twitter_sentiment_momentum",
+            "twitter_volume",
         )
         out: dict[str, float] = {}
         for k in keys:
@@ -404,7 +422,9 @@ class Predictor:
         training_meta = load_training_metadata(coin_dir)
 
         history = df[req].copy()
-        feat_live = build_features(history.tail(min(1000, len(history))), include_targets=False)
+        feat_live = build_features(
+            history.tail(min(1000, len(history))), include_targets=False, coin=coin
+        )
         live_ix = feat_live.iloc[-1].index if len(feat_live) else pd.Index([])
         bundle_audit = evaluate_artifact_bundle(
             coin_dir,
@@ -424,6 +444,7 @@ class Predictor:
                 bundle,
                 training_meta=training_meta,
                 horizon=HORIZON_DAYS,
+                coin=coin,
             )
         except Exception as e:
             logger.exception("Recursive forecast failed for %s: %s", coin, e)
@@ -465,6 +486,11 @@ class Predictor:
         sig_strength = compute_signal_strength_score(
             current_close, float(last["predicted_price"]), feature_context
         )
+        sig_strength = blend_signal_strength_with_twitter(
+            sig_strength,
+            feature_context.get("twitter_sentiment"),
+            feature_context.get("twitter_volume"),
+        )
         vr_enc = feature_context.get("vol_regime_encoded")
 
         merged = dict(forecast_diag)
@@ -493,22 +519,13 @@ class Predictor:
         trend_for_hc, _ = classify_trend_from_forecast_path(
             current_close, path_raw, log_vol_daily=log_v_hc
         )
-        merged["high_conviction"] = bool(
-            compute_high_conviction(
-                signal_strength=sig_strength,
-                mean_path_agreement=mean_agree,
-                feature_context=feature_context,
-                implied_horizon_return=implied_ret,
-                directional_probs=dir_probs,
-                trend_label=trend_for_hc,
-            )
-        )
         validity, qscore = compute_forecast_validity_and_quality_score(merged)
         merged["forecast_validity"] = validity
         merged["forecast_quality_score"] = qscore
         merged["confidence_composition_reference"] = confidence_composition_doc()
 
         fq_conf = str(merged.get("forecast_quality", "degraded"))
+        sentiment_diag: dict[str, Any] = {}
         raw_conf = compute_financial_confidence(
             agreements,
             lr_matrix,
@@ -524,13 +541,71 @@ class Predictor:
             directional_probs=dir_probs,
             implied_horizon_log_return=implied_lr,
             vol_regime_encoded=float(vr_enc) if vr_enc is not None else None,
+            trend_consistency_score=feature_context.get("trend_consistency_score"),
+            twitter_sentiment=feature_context.get("twitter_sentiment"),
+            twitter_volume=feature_context.get("twitter_volume"),
+            sentiment_diag_out=sentiment_diag,
         )
-        merged["confidence_score"] = finalize_forecast_confidence(
+        merged.update(sentiment_diag)
+        base_confidence = finalize_forecast_confidence(
             apply_confidence_penalty_caps(raw_conf, merged),
             mean_path_agreement=mean_agree,
             directional_probs=dir_probs,
             vol_regime=str(merged.get("volatility_regime") or "MEDIUM"),
         )
+        merged["confidence_score_base"] = round(float(base_confidence), 4)
+        dec = compute_decision_bundle(
+            current_price=current_close,
+            final_prediction=float(last["predicted_price"]),
+            lower_bound=float(last["lower_bound"]),
+            upper_bound=float(last["upper_bound"]),
+            base_confidence=float(base_confidence),
+            mean_path_agreement=mean_agree,
+            signal_strength_score=float(sig_strength),
+            trend_label=str(trend_for_hc),
+            directional_probs=dir_probs,
+            volatility_regime=str(merged.get("volatility_regime") or "MEDIUM"),
+            feature_context=feature_context,
+            is_constant_prediction=bool(merged.get("is_constant_prediction")),
+            degraded_input=bool(merged.get("degraded_input")),
+            low_variance_warning=bool(merged.get("low_variance_warning")),
+            coin=coin,
+            trend_consistency_score=feature_context.get("trend_consistency_score"),
+        )
+        merged["confidence_score"] = float(dec["confidence_after_decision"])
+        merged["high_conviction"] = bool(dec["high_conviction"])
+        merged["trade_signal"] = str(dec["trade_signal"])
+        merged["edge_score"] = float(dec["edge_score"])
+        merged["expected_move_pct"] = float(dec["expected_move_pct"])
+        merged["expected_move_strength"] = str(dec["expected_move_strength"])
+        merged["risk_reward_ratio"] = float(dec["risk_reward_ratio"])
+        merged["trade_valid"] = bool(dec["trade_valid"])
+        merged["directional_alignment"] = bool(dec["directional_alignment"])
+        merged["decision_rejection_reasons"] = list(dec["decision_rejection_reasons"])
+        merged["decision_explanation_append"] = format_trade_decision_explanation(
+            dec, mean_path_agreement=mean_agree
+        )
+        merged["trend_consistency_score"] = float(dec.get("trend_consistency_score", 0.0))
+        merged["decision_threshold_scale"] = float(dec.get("decision_threshold_scale", 1.0))
+        merged["recent_no_trade_fraction"] = float(dec.get("recent_no_trade_fraction", 0.0))
+        merged["trade_missing_for_actionable"] = list(dec.get("trade_missing_for_actionable") or [])
+
+        trade_eval = evaluate_trade_opportunity({
+            "confidence_score": float(merged["confidence_score"]),
+            "mean_path_agreement": float(mean_agree),
+            "signal_strength_score": float(merged["signal_strength_score"]),
+            "directional_probabilities": dir_probs,
+            "volatility_regime": str(merged.get("volatility_regime") or "MEDIUM"),
+            "expected_move_pct": float(merged["expected_move_pct"]),
+            "risk_reward_ratio": float(merged["risk_reward_ratio"]),
+            "trend_label": str(trend_for_hc),
+            "forecast_bullish": float(last["predicted_price"]) > current_close,
+            "sentiment_alignment": float(merged.get("sentiment_alignment", 0.0)),
+            "adx_14": feature_context.get("adx_14"),
+        })
+        merged["trade_decision"] = str(trade_eval["decision"])
+        merged["edge_score"] = float(trade_eval["score"])
+        merged["trade_reasons"] = list(trade_eval["reasons"])
 
         return {
             "coin": coin,
@@ -632,7 +707,10 @@ class Predictor:
         agreements = [float(x["agreement_score"]) for x in forecast_path]
         diag = raw.get("_forecast_diagnostics") or {}
         fq = str(diag.get("forecast_quality", "degraded"))
+        mean_agree = float(raw.get("_mean_path_agreement") or np.mean(agreements))
         conf_pre = diag.get("confidence_score")
+        dec_fb: dict[str, Any] | None = None
+        diag_fb_sent: dict[str, Any] = {}
         if conf_pre is not None:
             confidence = float(conf_pre)
         else:
@@ -641,6 +719,7 @@ class Predictor:
                 for p in path_data
             ]
             vr_raw = fc_ctx.get("vol_regime_encoded")
+            sentiment_fb: dict[str, Any] = {}
             confidence = compute_financial_confidence(
                 agreements,
                 lr_matrix_fb,
@@ -660,19 +739,47 @@ class Predictor:
                 if current > 0
                 else 0.0,
                 vol_regime_encoded=float(vr_raw) if vr_raw is not None else None,
+                trend_consistency_score=fc_ctx.get("trend_consistency_score"),
+                twitter_sentiment=fc_ctx.get("twitter_sentiment"),
+                twitter_volume=fc_ctx.get("twitter_volume"),
+                sentiment_diag_out=sentiment_fb,
             )
+            diag_fb_sent = sentiment_fb
             confidence = apply_confidence_penalty_caps(confidence, diag)
             confidence = finalize_forecast_confidence(
                 confidence,
-                mean_path_agreement=float(raw.get("_mean_path_agreement") or np.mean(agreements)),
+                mean_path_agreement=mean_agree,
                 directional_probs=diag.get("directional_probabilities"),
                 vol_regime=str(diag.get("volatility_regime") or infer_volatility_regime_from_context(fc_ctx)),
             )
+            lr = path_data[-1]
+            dec_fb = compute_decision_bundle(
+                current_price=float(current),
+                final_prediction=float(lr["predicted_price"]),
+                lower_bound=float(lr["lower_bound"]),
+                upper_bound=float(lr["upper_bound"]),
+                base_confidence=float(confidence),
+                mean_path_agreement=mean_agree,
+                signal_strength_score=float(diag.get("signal_strength_score") or 0.0),
+                trend_label=str(trend_label),
+                directional_probs=diag.get("directional_probabilities"),
+                volatility_regime=str(
+                    diag.get("volatility_regime") or infer_volatility_regime_from_context(fc_ctx)
+                ),
+                feature_context=fc_ctx,
+                is_constant_prediction=bool(diag.get("is_constant_prediction")),
+                degraded_input=bool(diag.get("degraded_input")),
+                low_variance_warning=bool(diag.get("low_variance_warning")),
+                coin=coin,
+                trend_consistency_score=fc_ctx.get("trend_consistency_score"),
+            )
+            confidence = float(dec_fb["confidence_after_decision"])
 
         volatility_level = classify_volatility_level(rv, current if current else None)
         if volatility_level == "UNKNOWN":
             volatility_level = infer_volatility_regime_from_context(fc_ctx)
-        mean_agree = float(raw.get("_mean_path_agreement") or np.mean(agreements))
+        diag_for_api = {**diag, **diag_fb_sent}
+        dec_src: dict[str, Any] = diag if conf_pre is not None else (dec_fb or diag)
         ilr_explain = (
             math.log(max(float(path_data[-1]["predicted_price"]), 1e-30) / max(float(current), 1e-30))
             if current > 0
@@ -696,6 +803,29 @@ class Predictor:
             explanation += " Forecast path shows unusually low variance; uncertainty is elevated."
         if bool(diag.get("degraded_input")):
             explanation += " Many features were missing or width-aligned (zero-filled); retrain with current feature schema."
+
+        dec_append = str(diag.get("decision_explanation_append") or "").strip()
+        if not dec_append:
+            if dec_fb is not None:
+                dec_append = format_trade_decision_explanation(dec_fb, mean_path_agreement=mean_agree).strip()
+            else:
+                dec_append = format_trade_decision_explanation(
+                    {
+                        "trade_signal": dec_src.get("trade_signal", "NO_TRADE"),
+                        "trade_valid": dec_src.get("trade_valid", False),
+                        "expected_move_strength": dec_src.get("expected_move_strength", "WEAK"),
+                        "risk_reward_ratio": dec_src.get("risk_reward_ratio", 0.0),
+                        "edge_score": dec_src.get("edge_score", 0.0),
+                        "decision_rejection_reasons": dec_src.get("decision_rejection_reasons") or [],
+                        "trend_consistency_score": dec_src.get("trend_consistency_score"),
+                        "decision_threshold_scale": dec_src.get("decision_threshold_scale"),
+                        "recent_no_trade_fraction": dec_src.get("recent_no_trade_fraction"),
+                        "trade_missing_for_actionable": dec_src.get("trade_missing_for_actionable") or [],
+                    },
+                    mean_path_agreement=mean_agree,
+                ).strip()
+        if dec_append:
+            explanation = explanation.rstrip() + " " + dec_append
 
         multi_horizon = build_multi_horizon(forecast_path, current)
 
@@ -758,14 +888,34 @@ class Predictor:
                 "ensemble_log_return_var": float(diag.get("ensemble_log_return_var", 0.0)),
                 "price_relative_variance": float(diag.get("price_relative_variance", 0.0)),
                 "max_missing_feature_fill_ratio": float(diag.get("max_missing_feature_fill_ratio", 0.0)),
+                "twitter_sentiment_used": bool(diag_for_api.get("twitter_sentiment_used", False)),
+                "sentiment_alignment": float(diag_for_api.get("sentiment_alignment", 0.0)),
+                "sentiment_confidence_contribution": float(
+                    diag_for_api.get("sentiment_confidence_contribution", 0.0)
+                ),
             },
             "is_constant_prediction": bool(diag.get("is_constant_prediction", False)),
             "low_variance_warning": bool(diag.get("low_variance_warning", False)),
             "degraded_input": bool(diag.get("degraded_input", False)),
-            "high_conviction": bool(diag.get("high_conviction", False)),
+            "high_conviction": bool(dec_fb["high_conviction"])
+            if dec_fb is not None
+            else bool(diag.get("high_conviction", False)),
             "signal_strength_score": float(diag.get("signal_strength_score") or 0.0),
             "directional_probabilities": dict(diag.get("directional_probabilities") or {}),
             "volatility_regime": str(
                 diag.get("volatility_regime") or infer_volatility_regime_from_context(fc_ctx)
             ),
+            "trade_signal": str(dec_src.get("trade_signal", "NO_TRADE")),
+            "edge_score": float(diag.get("edge_score", dec_src.get("edge_score", 0.0))),
+            "trade_decision": str(diag.get("trade_decision", "NO_TRADE")),
+            "trade_reasons": list(diag.get("trade_reasons") or []),
+            "expected_move_pct": float(dec_src.get("expected_move_pct", 0.0)),
+            "expected_move_strength": str(dec_src.get("expected_move_strength", "WEAK")),
+            "risk_reward_ratio": float(dec_src.get("risk_reward_ratio", 0.0)),
+            "trade_valid": bool(dec_src.get("trade_valid", False)),
+            "directional_alignment": bool(dec_src.get("directional_alignment", False)),
+            "trend_consistency_score": float(dec_src.get("trend_consistency_score", 0.0)),
+            "decision_threshold_scale": float(dec_src.get("decision_threshold_scale", 1.0)),
+            "recent_no_trade_fraction": float(dec_src.get("recent_no_trade_fraction", 0.0)),
+            "trade_missing_for_actionable": list(dec_src.get("trade_missing_for_actionable") or []),
         }

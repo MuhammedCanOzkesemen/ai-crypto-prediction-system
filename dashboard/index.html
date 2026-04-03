@@ -98,6 +98,23 @@
           <span id="pred-mean-agreement" class="value">—</span>
         </div>
       </div>
+
+      <div id="trade-signal-block" class="trade-signal-block hidden">
+        <h3>Trade signal <span class="hint">(strict engine)</span></h3>
+        <div class="trade-signal-grid">
+          <div class="trade-signal-item">
+            <span class="label">Decision</span>
+            <span id="trade-decision-badge" class="trade-decision-badge td-none">—</span>
+          </div>
+          <div class="trade-signal-item">
+            <span class="label">Edge score</span>
+            <span id="trade-edge-score" class="value trade-edge-value">—</span>
+          </div>
+        </div>
+        <p class="trade-signal-sub">conf × agreement × signal strength (± regime / classifier / sentiment / ADX)</p>
+        <ul id="trade-reasons-list" class="trade-reasons-list"></ul>
+      </div>
+
       <div id="pred-quality-strip" class="quality-strip hidden" role="status" aria-live="polite"></div>
       <div id="pred-explanation-block" class="explanation-block hidden">
         <h3>Why this forecast</h3>

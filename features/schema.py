@@ -8,7 +8,7 @@ Feature column order matches ``get_feature_columns(include_targets=False)`` in f
 from __future__ import annotations
 
 # Bump when changing feature definitions or column order (retrain all coins).
-FEATURE_SCHEMA_VERSION: int = 4
+FEATURE_SCHEMA_VERSION: int = 7
 
 TRAINING_TARGET_COLUMN: str = "target_log_return_1d"
 TRAINING_TARGET_DESCRIPTION: str = "Next-day log return log(close_{t+1}/close_t); never raw price."
@@ -33,6 +33,10 @@ def official_schema_documentation() -> dict[str, object]:
         "notes": (
             "RSI, MACD, BB, EMA/SMA, ATR, rolling vol; returns 1/3/7/14d; ROC; ADX/+DI/-DI; "
             "log-return momentum 3/7/14d; rolling & EWMA log vol 14/30; vol regime; EMA cross; "
-            "interactions (momentum×vol, RSI×ADX, MACD×log-ret accel); log_close lags; daily_return lags."
+            "interactions (momentum×vol, RSI×ADX, MACD×log-ret accel); breakouts vs 20d high/low; "
+            "vol expansion; compression→expansion (BB width); 14d/20d breakouts; ema slope accel; "
+            "momentum change rate; trend_consistency (5d+7d sign + EMA/ADX); optional Twitter/VADER daily "
+            "sentiment + volume + momentum and sentiment×momentum / sentiment×vol interactions; "
+            "log_close lags; daily_return lags."
         ),
     }

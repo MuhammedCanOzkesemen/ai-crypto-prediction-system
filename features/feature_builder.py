@@ -246,11 +246,60 @@ def add_targets(df: pd.DataFrame, horizon: int = TARGET_HORIZON_DAYS, column: st
 # -----------------------------------------------------------------------------
 
 
+def _attach_twitter_sentiment_block(df: pd.DataFrame, coin: str | None) -> None:
+    """Merge optional Twitter/VADER daily features; neutral zeros on failure or missing coin."""
+    tw_cols = (
+        "twitter_sentiment",
+        "twitter_sentiment_7d_avg",
+        "twitter_sentiment_momentum",
+        "twitter_volume",
+    )
+    coin_s = (coin or "").strip()
+    if not coin_s:
+        for c in tw_cols:
+            df[c] = 0.0
+        df["sentiment_x_momentum"] = 0.0
+        df["sentiment_x_volatility"] = 0.0
+        return
+    try:
+        from data.twitter_sentiment import daily_sentiment_features_for_price_dates
+
+        tw = daily_sentiment_features_for_price_dates(coin_s, df["date"])
+    except Exception as e:
+        logger.debug("Twitter sentiment features skipped: %s", e)
+        tw = None
+    mom7 = df["momentum_logret_7d"].astype(float).fillna(0.0)
+    rstd14 = df["rolling_std_logret_14"].astype(float).fillna(0.0).clip(0.0, 0.25)
+    if tw is None or tw.empty:
+        for c in tw_cols:
+            df[c] = 0.0
+        df["sentiment_x_momentum"] = 0.0
+        df["sentiment_x_volatility"] = 0.0
+        return
+    sub = tw.rename(
+        columns={"sentiment_score": "twitter_sentiment", "sentiment_volume": "twitter_volume"}
+    ).copy()
+    sub["date"] = pd.to_datetime(sub["date"]).dt.normalize().dt.tz_localize(None)
+    lut = sub.set_index("date")
+    idx = pd.to_datetime(df["date"]).dt.normalize().dt.tz_localize(None)
+    df["twitter_sentiment"] = idx.map(lut["twitter_sentiment"]).fillna(0.0).astype(float).clip(-1.0, 1.0)
+    df["twitter_volume"] = idx.map(lut["twitter_volume"]).fillna(0.0).astype(float).clip(0.0, 1e6)
+    df["twitter_sentiment_7d_avg"] = (
+        idx.map(lut["twitter_sentiment_7d_avg"]).fillna(0.0).astype(float).clip(-1.0, 1.0)
+    )
+    df["twitter_sentiment_momentum"] = (
+        idx.map(lut["twitter_sentiment_momentum"]).fillna(0.0).astype(float).clip(-1.0, 1.0)
+    )
+    df["sentiment_x_momentum"] = (df["twitter_sentiment"] * mom7).clip(-0.2, 0.2)
+    df["sentiment_x_volatility"] = (df["twitter_sentiment"] * rstd14).clip(-0.06, 0.06)
+
+
 def build_features(
     price_df: pd.DataFrame,
     *,
     include_targets: bool = True,
     target_horizon: int = TARGET_HORIZON_DAYS,
+    coin: str | None = None,
 ) -> pd.DataFrame:
     """
     Build a clean, ML-ready feature DataFrame from a price DataFrame.
@@ -259,7 +308,7 @@ def build_features(
 
     Indicators: RSI, MACD, BB, EMA/SMA, ATR, rolling vol, 3/7/14d returns, ROC, ADX/DI,
     log-return momentum sums, rolling/EWMA log vol (14/30), vol regime, EMA cross, interactions,
-    log_close + lags, daily_return lags, volume_change.
+    optional Twitter sentiment (when ``coin`` is set), log_close + lags, daily_return lags, volume_change.
 
     Targets (if include_targets): target_log_return_1d (next-day log return).
 
@@ -343,8 +392,73 @@ def build_features(
     # EMA cross (normalized by price)
     df["ema_cross_norm"] = ((df["ema_20"] - df["ema_50"]) / (pc.replace(0, np.nan) + 1e-30)).clip(-0.5, 0.5)
 
-    # Acceleration of log returns
+    # Acceleration of log returns (1st and 2nd difference — momentum acceleration)
     df["log_return_accel"] = lr.diff()
+    df["log_return_accel2"] = lr.diff().diff()
+
+    # Breakout / range position vs recent highs & lows
+    high20 = df["high"].astype(float).rolling(20, min_periods=5).max().shift(1)
+    low20 = df["low"].astype(float).rolling(20, min_periods=5).min().shift(1)
+    df["breakout_above_20d_high"] = (pc > high20).astype(np.float64)
+    df["breakout_below_20d_low"] = (pc < low20).astype(np.float64)
+    df["dist_to_roll_high_20"] = ((high20 - pc) / (pc.replace(0, np.nan) + 1e-30)).clip(-0.5, 0.5).fillna(0.0)
+    df["dist_to_roll_low_20"] = ((pc - low20) / (pc.replace(0, np.nan) + 1e-30)).clip(-0.5, 0.5).fillna(0.0)
+    roll_rng = (high20 - low20).replace(0, np.nan)
+    df["range_position_14d_window"] = ((pc - low20) / (roll_rng + 1e-30)).clip(0.0, 1.0).fillna(0.5)
+
+    # 14d breakout context (tighter window for earlier explosive-move cues)
+    high14 = df["high"].astype(float).rolling(14, min_periods=4).max().shift(1)
+    low14 = df["low"].astype(float).rolling(14, min_periods=4).min().shift(1)
+    df["breakout_above_14d_high"] = (pc > high14).astype(np.float64)
+    df["breakout_below_14d_low"] = (pc < low14).astype(np.float64)
+    df["dist_to_roll_high_14"] = ((high14 - pc) / (pc.replace(0, np.nan) + 1e-30)).clip(-0.5, 0.5).fillna(0.0)
+    df["dist_to_roll_low_14"] = ((pc - low14) / (pc.replace(0, np.nan) + 1e-30)).clip(-0.5, 0.5).fillna(0.0)
+
+    # EMA slope acceleration + 7d momentum change rate (directional acceleration)
+    es1 = (df["ema_20"].astype(float).diff() / (pc.replace(0, np.nan) + 1e-30)).replace(
+        [np.inf, -np.inf], np.nan
+    ).fillna(0.0)
+    df["ema_slope_accel"] = es1.diff().fillna(0.0).clip(-0.1, 0.1)
+    mom7s = df["momentum_logret_7d"].astype(float)
+    df["momentum_change_rate"] = mom7s.diff().fillna(0.0).clip(-0.25, 0.25)
+
+    # Volatility expansion (current EWMA vs its recent mean)
+    ev14 = df["ewma_vol_logret_14"].astype(float)
+    ev_ma = ev14.rolling(20, min_periods=5).mean()
+    vol_ratio = (ev14 / (ev_ma + 1e-12)).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.15, 5.0)
+    df["vol_expansion_ratio"] = vol_ratio
+    df["vol_expansion_score"] = ((vol_ratio - 1.0).clip(-0.8, 2.5) + 0.8) / 3.3
+
+    # Compression → expansion: Bollinger width vs its recent mean (squeeze then release)
+    bb_mid_w = df["bb_middle"].astype(float)
+    bb_width = (df["bb_upper"].astype(float) - df["bb_lower"].astype(float)) / (bb_mid_w.abs() + 1e-30)
+    bb_w_ma = bb_width.rolling(14, min_periods=5).mean()
+    rel_bw = (bb_width / (bb_w_ma + 1e-12)).replace([np.inf, -np.inf], np.nan).fillna(1.0).clip(0.2, 4.0)
+    df["compression_expansion_score"] = ((rel_bw - 1.0).clip(-0.6, 2.0) + 0.6) / 2.6
+
+    # Trend consistency: last-5 and last-7 return direction agreement, EMA stability, ADX persistence
+    lr_clean = lr.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    def _sign_coherence(win: int, min_p: int) -> pd.Series:
+        return lr_clean.rolling(win, min_periods=min_p).apply(
+            lambda x: float(np.abs(np.mean(np.sign(np.asarray(x, dtype=float))))) if len(x) >= min_p else 0.0,
+            raw=True,
+        ).fillna(0.0).clip(0.0, 1.0)
+
+    sign5 = _sign_coherence(5, 3)
+    sign7 = _sign_coherence(7, 3)
+    # Penalize chop: both windows must agree somewhat
+    sign_cons = 0.48 * sign5 + 0.32 * sign7 + 0.20 * pd.concat([sign5, sign7], axis=1).min(axis=1)
+    es = (df["ema_20"].astype(float).diff() / (pc.replace(0, np.nan) + 1e-30)).replace(
+        [np.inf, -np.inf], np.nan
+    ).fillna(0.0)
+    ema_stab = (1.0 / (1.0 + es.rolling(5, min_periods=2).std().fillna(0.0) * 120.0)).clip(0.0, 1.0)
+    adx_r = df[f"adx_{ADX_PERIOD}"].astype(float)
+    adx_ma = adx_r.rolling(5, min_periods=1).mean()
+    adx_persist = ((adx_r / (adx_ma + 1e-8)).clip(0.5, 2.0) - 0.5) / 1.5
+    df["trend_consistency_score"] = (
+        0.40 * sign_cons + 0.32 * ema_stab.fillna(0.5) + 0.28 * adx_persist.fillna(0.5)
+    ).clip(0.0, 1.0)
 
     # Feature interactions (tree-friendly nonlinear cues)
     r7 = df["return_7d"].astype(float).clip(-0.5, 0.5)
@@ -356,6 +470,8 @@ def build_features(
     df["interact_mom7_vol"] = (r7 * rstd14).clip(-0.15, 0.15)
     df["interact_rsi_adx"] = (rsi_n * adx_n).clip(-0.5, 0.5)
     df["interact_macd_accel"] = (mac_h * acc * 100.0).clip(-2.0, 2.0)
+
+    _attach_twitter_sentiment_block(df, coin)
 
     # Level in log space — stable magnitude for micro-cap coins (replaces raw close lags)
     df["log_close"] = np.log(np.maximum(pc, 1e-30))
@@ -412,9 +528,31 @@ def get_feature_columns(include_targets: bool = False) -> list[str]:
         "trend_strength_adx",
         "ema_cross_norm",
         "log_return_accel",
+        "log_return_accel2",
+        "breakout_above_20d_high",
+        "breakout_below_20d_low",
+        "dist_to_roll_high_20",
+        "dist_to_roll_low_20",
+        "range_position_14d_window",
+        "breakout_above_14d_high",
+        "breakout_below_14d_low",
+        "dist_to_roll_high_14",
+        "dist_to_roll_low_14",
+        "ema_slope_accel",
+        "momentum_change_rate",
+        "vol_expansion_ratio",
+        "vol_expansion_score",
+        "compression_expansion_score",
+        "trend_consistency_score",
         "interact_mom7_vol",
         "interact_rsi_adx",
         "interact_macd_accel",
+        "twitter_sentiment",
+        "twitter_sentiment_7d_avg",
+        "twitter_sentiment_momentum",
+        "twitter_volume",
+        "sentiment_x_momentum",
+        "sentiment_x_volatility",
         "log_close",
         "volume_change",
     ]

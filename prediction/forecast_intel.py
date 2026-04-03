@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from data.twitter_sentiment import MIN_TWEETS_FOR_CONFIDENCE
 from utils.constants import VOL_REGIME_LOGBOUND_HIGH, VOL_REGIME_LOGBOUND_LOW
 
 # Trend: z = predicted return / daily vol (rolling); thresholds in "sigmas"
@@ -44,6 +45,31 @@ _FIN_ERR_REF = 0.05
 _FIN_VOL_REF = 0.04
 
 
+def mean_effective_logret_variance(lr_matrix: list[list[float]]) -> tuple[float, float]:
+    """
+    (effective_mean_var, raw_mean_var).
+
+    When models disagree only in magnitude (same sign), variance is down-weighted vs chaotic
+    (mixed signs), which should be penalized more heavily.
+    """
+    raw_list: list[float] = []
+    eff_list: list[float] = []
+    for row in lr_matrix:
+        if len(row) < 2:
+            continue
+        arr = np.asarray(row, dtype=np.float64)
+        raw_list.append(float(np.var(arr)))
+        s = np.sign(arr)
+        n_pos = int(np.sum(s > 0))
+        n_neg = int(np.sum(s < 0))
+        chaotic = n_pos >= 1 and n_neg >= 1
+        v = float(np.var(arr))
+        eff_list.append(v if chaotic else v * 0.28)
+    mean_raw = float(np.mean(raw_list)) if raw_list else 0.0
+    mean_eff = float(np.mean(eff_list)) if eff_list else mean_raw
+    return mean_eff, mean_raw
+
+
 def apply_confidence_penalty_caps(confidence: float, diag: dict[str, Any]) -> float:
     """Post-process financial confidence from path-level honesty flags."""
     c = float(confidence)
@@ -74,7 +100,12 @@ def compute_signal_strength_score(
     z_move = abs(ret) / max(vol * math.sqrt(14.0), 1e-8)
     adx_part = min(1.0, (float(fc.get("adx_14") or 0.0) / 45.0) ** 0.9)
     mom_part = min(1.0, abs(float(fc.get("return_7d") or 0.0)) / 0.06)
-    raw = 0.42 * min(1.0, z_move / 2.2) + 0.33 * adx_part + 0.25 * mom_part
+    tc = float(fc.get("trend_consistency_score") or 0.0)
+    tc = max(0.0, min(1.0, tc))
+    br = 0.5 * (
+        float(fc.get("breakout_above_20d_high") or 0.0) + float(fc.get("breakout_below_20d_low") or 0.0)
+    )
+    raw = 0.40 * min(1.0, z_move / 2.2) + 0.30 * adx_part + 0.22 * mom_part + 0.05 * tc + 0.03 * br
     return float(max(0.0, min(1.0, raw)))
 
 
@@ -253,6 +284,28 @@ def finalize_forecast_confidence(
     return float(max(0.0, min(1.0, c)))
 
 
+def blend_signal_strength_with_twitter(
+    signal_strength: float,
+    twitter_sentiment: float | None,
+    twitter_volume: float | None,
+) -> float:
+    """Nudge signal strength by |sentiment| when tweet volume is meaningful; capped."""
+    ss = float(max(0.0, min(1.0, signal_strength)))
+    if twitter_sentiment is None or twitter_volume is None:
+        return ss
+    try:
+        tv = float(twitter_volume)
+        ts = float(twitter_sentiment)
+    except (TypeError, ValueError):
+        return ss
+    if not math.isfinite(tv) or not math.isfinite(ts) or tv < float(MIN_TWEETS_FOR_CONFIDENCE):
+        return ss
+    vol_w = min(1.0, tv / 120.0)
+    mag = min(1.0, abs(ts))
+    bump = min(0.07, 0.055 * mag * vol_w)
+    return float(max(0.0, min(1.0, ss + bump)))
+
+
 def compute_financial_confidence(
     path_agreement_scores: list[float],
     lr_matrix: list[list[float]],
@@ -269,21 +322,21 @@ def compute_financial_confidence(
     directional_probs: dict[str, float] | None = None,
     implied_horizon_log_return: float = 0.0,
     vol_regime_encoded: float | None = None,
+    trend_consistency_score: float | None = None,
+    twitter_sentiment: float | None = None,
+    twitter_volume: float | None = None,
+    sentiment_diag_out: dict[str, Any] | None = None,
 ) -> float:
     """
     Confidence in [0, 1] from metrics, volatility, and model spread — heavily penalized
     when forecasts are degraded, guardrails fire, or outputs are clip-saturated together.
     """
-    vars_per_step: list[float] = []
-    for row in lr_matrix:
-        if len(row) >= 2:
-            vars_per_step.append(float(np.var(np.array(row, dtype=np.float64))))
-    mean_var = float(np.mean(vars_per_step)) if vars_per_step else 0.0
-    # Very low variance across models is suspicious (shared failure / clip collapse), not strength.
-    if mean_var < 1e-8 and len(lr_matrix) >= 2:
+    mean_var_eff, mean_var_raw = mean_effective_logret_variance(lr_matrix)
+    # Very low raw variance across models is suspicious (shared failure / clip collapse), not strength.
+    if mean_var_raw < 1e-8 and len(lr_matrix) >= 2:
         inv_model_var = 0.35
     else:
-        inv_model_var = 1.0 / (1.0 + mean_var / max(_FIN_VAR_REF, 1e-12))
+        inv_model_var = 1.0 / (1.0 + mean_var_eff / max(_FIN_VAR_REF, 1e-12))
         inv_model_var = float(max(0.0, min(1.0, inv_model_var)))
 
     err_vals: list[float] = []
@@ -308,7 +361,7 @@ def compute_financial_confidence(
     cu = classifier_uncertainty_score(directional_probs)
 
     # Agreement drives the blend weight — low agreement should not be masked by error/vol terms.
-    agree_w = 0.22 if mean_var >= 1e-9 else 0.18
+    agree_w = 0.22 if mean_var_raw >= 1e-9 else 0.18
     w_var, w_err, w_vol = 0.26, 0.26, 0.26
     w_sum = w_var + w_err + w_vol + agree_w
     w_var, w_err, w_vol, agree_w = w_var / w_sum, w_err / w_sum, w_vol / w_sum, agree_w / w_sum
@@ -354,6 +407,53 @@ def compute_financial_confidence(
 
     if vol_regime_encoded is not None and float(vol_regime_encoded) >= 1.85:
         combined *= 0.86
+
+    if trend_consistency_score is not None:
+        try:
+            tc = float(trend_consistency_score)
+            if math.isfinite(tc):
+                tc = max(0.0, min(1.0, tc))
+                if tc >= 0.60:
+                    combined = min(1.0, combined * (1.0 + 0.072 * (tc - 0.60) / 0.40))
+                elif tc < 0.36:
+                    combined *= 0.91
+        except (TypeError, ValueError):
+            pass
+
+    pre_sentiment_conf = combined
+    tw_used = False
+    tw_align = 0.0
+    try:
+        tv = float(twitter_volume) if twitter_volume is not None else None
+        ts = float(twitter_sentiment) if twitter_sentiment is not None else None
+    except (TypeError, ValueError):
+        tv, ts = None, None
+    if (
+        tv is not None
+        and ts is not None
+        and math.isfinite(tv)
+        and math.isfinite(ts)
+        and tv >= float(MIN_TWEETS_FOR_CONFIDENCE)
+    ):
+        tw_used = True
+        vol_w = min(1.0, float(tv) / 120.0)
+        s_mag = min(1.0, abs(float(ts)))
+        ilr = float(implied_horizon_log_return)
+        if abs(ilr) >= 0.0015 and s_mag >= 0.06:
+            same = (ilr > 0 and ts > 0.04) or (ilr < 0 and ts < -0.04)
+            conflict = (ilr > 0 and ts < -0.07) or (ilr < 0 and ts > 0.07)
+            if same:
+                tw_align = 1.0
+                combined = min(1.0, combined * (1.0 + min(0.045, 0.03 * vol_w * s_mag)))
+            elif conflict:
+                tw_align = -1.0
+                combined *= 1.0 - min(0.055, 0.042 * vol_w * s_mag)
+    if sentiment_diag_out is not None:
+        sentiment_diag_out["twitter_sentiment_used"] = bool(tw_used)
+        sentiment_diag_out["sentiment_alignment"] = float(tw_align)
+        sentiment_diag_out["sentiment_confidence_contribution"] = round(
+            float(combined - pre_sentiment_conf), 6
+        )
 
     if forecast_quality != "production":
         combined *= 0.52

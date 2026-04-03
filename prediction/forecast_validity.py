@@ -64,5 +64,8 @@ def confidence_composition_doc() -> str:
         "Signal-strength score, directional-classifier agreement/uncertainty, and vol regime adjust confidence; "
         "finalize_forecast_confidence() caps when agreement is low and the classifier is uncertain; "
         "caps also in apply_confidence_penalty_caps(). "
+        "decision_layer.apply_trade_aware_confidence() then scales confidence to trade reliability (edge, R:R, vol). "
+        "Cross-model log-return spread uses chaotic (mixed-sign) vs directional (same-sign) disagreement weighting. "
+        "trend_consistency_score from features can lift financial confidence when stable. "
         "See compute_financial_confidence() and predictor predict_from_latest_features() for parameters."
     )

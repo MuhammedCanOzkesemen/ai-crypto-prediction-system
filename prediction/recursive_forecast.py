@@ -26,6 +26,7 @@ from prediction.inference_utils import (
     infer_n_features_for_ensemble,
     prediction_matrix_to_dataframe,
     resolve_inference_columns,
+    slice_scaled_X_for_model,
 )
 from prediction.realism import (
     OUTER_DAILY_ABS_CAP,
@@ -102,6 +103,7 @@ def recursive_log_return_forecast(
     training_meta: dict[str, Any] | None = None,
     horizon: int = DEFAULT_HORIZON,
     vol_k: float = 2.0,
+    coin: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, float], float, dict[str, Any]]:
     """
     Returns path rows, final model prices, ewma_vol at t0, and diagnostics for API/metadata.
@@ -112,7 +114,9 @@ def recursive_log_return_forecast(
             raise ValueError(f"history_ohlcv missing column {c}")
 
     history = history_ohlcv[cols].copy().sort_values("date").reset_index(drop=True)
-    feat_df0 = build_features(history.tail(min(len(history), HISTORY_TAIL)), include_targets=False)
+    feat_df0 = build_features(
+        history.tail(min(len(history), HISTORY_TAIL)), include_targets=False, coin=coin
+    )
     bundle = scaler_bundle if scaler_bundle is not None else {}
     scaler = bundle.get("scaler")
     saved_cols = bundle.get("feature_columns")
@@ -126,7 +130,12 @@ def recursive_log_return_forecast(
     ewma_vol_start = 0.02
     path: list[dict[str, Any]] = []
     model_prices = {n: float(history["close"].iloc[-1]) for n in models}
-    n_features_model = infer_n_features_for_ensemble(models)
+    use_per_model_feats = bool(meta.get("per_model_feature_indices"))
+    n_features_model = (
+        len(columns)
+        if use_per_model_feats
+        else (infer_n_features_for_ensemble(models) or len(columns))
+    )
     spot_start = float(history["close"].iloc[-1])
 
     emergency_align_used = False
@@ -138,7 +147,7 @@ def recursive_log_return_forecast(
 
     for step in range(horizon):
         tail = history.tail(min(len(history), HISTORY_TAIL))
-        feat_df = build_features(tail, include_targets=False)
+        feat_df = build_features(tail, include_targets=False, coin=coin)
         if feat_df.empty or len(feat_df) < 1:
             logger.warning("recursive_forecast: empty features at step %d", step)
             break
@@ -181,10 +190,11 @@ def recursive_log_return_forecast(
         preds_lr: dict[str, float] = {}
         for name, model in models.items():
             try:
+                X_m, col_m = slice_scaled_X_for_model(Xs, name, meta, columns)
                 X_df = prediction_matrix_to_dataframe(
-                    Xs,
+                    X_m,
                     model_wrapper=model,
-                    training_feature_columns=columns,
+                    training_feature_columns=col_m,
                 )
                 r_raw = float(np.ravel(model.predict(X_df))[0])
                 raw_preds[name] = r_raw

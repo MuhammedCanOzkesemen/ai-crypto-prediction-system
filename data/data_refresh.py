@@ -164,7 +164,7 @@ def _run_fetch_and_features(
         logger.error("Refresh failed: no OHLCV for %s", coin)
         return False
 
-    feature_df = build_features(price_df, include_targets=True)
+    feature_df = build_features(price_df, include_targets=True, coin=coin)
     if feature_df.empty:
         logger.error("Refresh failed: empty features for %s", coin)
         return False

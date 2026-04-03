@@ -267,3 +267,35 @@ def save_scaler_bundle(coin_dir: Path, slug: str, scaler: Any, feature_columns: 
     alias = coin_dir / f"{slug}_scaler.joblib"
     if alias.resolve() != primary.resolve():
         joblib.dump(payload, alias)
+
+
+def slice_scaled_X_for_model(
+    Xs: np.ndarray,
+    model_name: str,
+    training_meta: dict[str, Any] | None,
+    full_columns: list[str],
+) -> tuple[np.ndarray, list[str]]:
+    """
+    Subset scaled feature row(s) to the columns each ensemble member was trained on.
+
+    Legacy artifacts without ``per_model_feature_indices`` use the full width.
+    """
+    Xs = np.asarray(Xs, dtype=np.float64)
+    if Xs.ndim == 1:
+        Xs = Xs.reshape(1, -1)
+    n = int(Xs.shape[1])
+    meta = training_meta or {}
+    raw = meta.get("per_model_feature_indices")
+    if not isinstance(raw, dict):
+        use_names = [str(full_columns[i]) for i in range(min(n, len(full_columns)))]
+        return Xs, use_names
+    idx_list = raw.get(model_name)
+    if not isinstance(idx_list, list) or not idx_list:
+        use_names = [str(full_columns[i]) for i in range(min(n, len(full_columns)))]
+        return Xs, use_names
+    idx = [int(i) for i in idx_list if 0 <= int(i) < n]
+    if not idx:
+        use_names = [str(full_columns[i]) for i in range(min(n, len(full_columns)))]
+        return Xs, use_names
+    names = [str(full_columns[i]) for i in idx if i < len(full_columns)]
+    return Xs[:, np.array(idx, dtype=np.int64)], names
