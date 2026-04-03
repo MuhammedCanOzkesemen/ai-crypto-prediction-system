@@ -43,10 +43,34 @@ class TestTradeFilter(unittest.TestCase):
                 "forecast_bullish": True,
                 "adx_14": 28.0,
                 "sentiment_alignment": 1.0,
+                "consensus_score": 0.75,
+                "stability_score": 0.65,
+                "trend_confirmation_score": 0.6,
+                "volatility_shock_detected": False,
             }
         )
         self.assertEqual(r["decision"], "STRONG_BUY")
         self.assertGreater(r["score"], 0.0)
+
+    def test_strong_downgrade_shock(self) -> None:
+        r = evaluate_trade_opportunity(
+            {
+                "confidence_score": 0.58,
+                "mean_path_agreement": 0.65,
+                "signal_strength_score": 0.55,
+                "directional_probabilities": {"up": 0.65, "down": 0.2, "neutral": 0.15},
+                "volatility_regime": "MEDIUM",
+                "expected_move_pct": 0.04,
+                "risk_reward_ratio": 1.6,
+                "trend_label": "UP",
+                "forecast_bullish": True,
+                "consensus_score": 0.75,
+                "stability_score": 0.65,
+                "trend_confirmation_score": 0.6,
+                "volatility_shock_detected": True,
+            }
+        )
+        self.assertNotEqual(r["decision"], "STRONG_BUY")
 
 
 if __name__ == "__main__":

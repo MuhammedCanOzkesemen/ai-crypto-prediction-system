@@ -326,6 +326,7 @@ def compute_financial_confidence(
     twitter_sentiment: float | None = None,
     twitter_volume: float | None = None,
     sentiment_diag_out: dict[str, Any] | None = None,
+    chaotic_model_disagreement: bool = False,
 ) -> float:
     """
     Confidence in [0, 1] from metrics, volatility, and model spread — heavily penalized
@@ -419,6 +420,9 @@ def compute_financial_confidence(
                     combined *= 0.91
         except (TypeError, ValueError):
             pass
+
+    if chaotic_model_disagreement:
+        combined *= 0.88
 
     pre_sentiment_conf = combined
     tw_used = False

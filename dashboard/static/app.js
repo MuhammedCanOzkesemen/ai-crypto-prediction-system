@@ -245,6 +245,39 @@
       tsBlock.classList.remove('hidden');
     }
 
+    function riskMeterLabel(score) {
+      if (typeof score !== 'number' || isNaN(score)) return '—';
+      var s = Math.max(0, Math.min(1, score));
+      var pct = (s * 100).toFixed(0);
+      var tier = s >= 0.65 ? 'strong' : s >= 0.45 ? 'mid' : 'weak';
+      return { text: pct + '%', tier: tier };
+    }
+
+    var riBlock = document.getElementById('risk-intel-block');
+    var rs = document.getElementById('risk-stability');
+    var rc = document.getElementById('risk-consensus');
+    var rt = document.getElementById('risk-trend-conf');
+    var rk = document.getElementById('risk-shock');
+    if (riBlock && rs && rc && rt && rk) {
+      var ms = riskMeterLabel(data.stability_score);
+      var mc = riskMeterLabel(data.consensus_score);
+      var mt = riskMeterLabel(data.trend_confirmation_score);
+      rs.textContent = ms.text;
+      rs.className = 'value risk-meter risk-' + ms.tier;
+      rc.textContent = mc.text;
+      rc.className = 'value risk-meter risk-' + mc.tier;
+      rt.textContent = mt.text;
+      rt.className = 'value risk-meter risk-' + mt.tier;
+      if (data.volatility_shock_detected === true) {
+        rk.textContent = 'Yes — elevated';
+        rk.className = 'value risk-shock-yes';
+      } else {
+        rk.textContent = 'No';
+        rk.className = 'value risk-shock-no';
+      }
+      riBlock.classList.remove('hidden');
+    }
+
     var qStrip = document.getElementById('pred-quality-strip');
     if (qStrip) {
       var am = data.artifact_mode || '—';

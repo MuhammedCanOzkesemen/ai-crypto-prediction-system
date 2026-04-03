@@ -119,6 +119,15 @@ class CoinPredictionResponse(BaseModel):
         0.0,
         description="Additive change to raw financial confidence from sentiment (capped)",
     )
+    stability_score: float = Field(0.0, ge=0.0, le=1.0, description="Forecast path stability [0,1]")
+    consensus_score: float = Field(0.0, ge=0.0, le=1.0, description="Multi-day ensemble direction consensus")
+    trend_confirmation_score: float = Field(
+        0.0, ge=0.0, le=1.0, description="EMA/ADX trend confirmation for long bias"
+    )
+    volatility_shock_detected: bool = Field(
+        False,
+        description="True when short-term vol exceeds ~1.8× recent average",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -352,6 +361,15 @@ class ForecastPathResponse(BaseModel):
         0.0,
         description="Additive change to raw financial confidence from sentiment (capped)",
     )
+    stability_score: float = Field(0.0, ge=0.0, le=1.0, description="Forecast path stability [0,1]")
+    consensus_score: float = Field(0.0, ge=0.0, le=1.0, description="Multi-day ensemble direction consensus")
+    trend_confirmation_score: float = Field(
+        0.0, ge=0.0, le=1.0, description="EMA/ADX trend confirmation for long bias"
+    )
+    volatility_shock_detected: bool = Field(
+        False,
+        description="True when short-term vol exceeds ~1.8× recent average",
+    )
 
 
 class RefreshResponse(BaseModel):
@@ -562,6 +580,10 @@ def create_app() -> FastAPI:
                     "sentiment_confidence_contribution", 0.0
                 )
             ),
+            stability_score=float(path_result.get("stability_score", 0.0)),
+            consensus_score=float(path_result.get("consensus_score", 0.0)),
+            trend_confirmation_score=float(path_result.get("trend_confirmation_score", 0.0)),
+            volatility_shock_detected=bool(path_result.get("volatility_shock_detected", False)),
         )
 
     @api_router.post("/refresh/{coin}", response_model=RefreshResponse)
@@ -720,6 +742,10 @@ def create_app() -> FastAPI:
                 "sentiment_confidence_contribution": float(
                     diag.get("sentiment_confidence_contribution", 0.0)
                 ),
+                "consensus_score": float(diag.get("consensus_score", 0.0)),
+                "stability_score": float(diag.get("stability_score", 0.0)),
+                "trend_confirmation_score": float(diag.get("trend_confirmation_score", 0.0)),
+                "volatility_shock_detected": bool(diag.get("volatility_shock_detected", False)),
             },
             is_constant_prediction=bool(diag.get("is_constant_prediction", False)),
             low_variance_warning=bool(diag.get("low_variance_warning", False)),
@@ -740,6 +766,10 @@ def create_app() -> FastAPI:
             twitter_sentiment_used=bool(diag.get("twitter_sentiment_used", False)),
             sentiment_alignment=float(diag.get("sentiment_alignment", 0.0)),
             sentiment_confidence_contribution=float(diag.get("sentiment_confidence_contribution", 0.0)),
+            stability_score=float(diag.get("stability_score", 0.0)),
+            consensus_score=float(diag.get("consensus_score", 0.0)),
+            trend_confirmation_score=float(diag.get("trend_confirmation_score", 0.0)),
+            volatility_shock_detected=bool(diag.get("volatility_shock_detected", False)),
         )
 
     # Dashboard (defined before mount so it takes precedence)

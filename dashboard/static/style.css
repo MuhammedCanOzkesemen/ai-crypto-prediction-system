@@ -268,6 +268,57 @@ body {
   margin-left: -1.15rem;
 }
 
+.risk-intel-block {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.risk-intel-block h3 {
+  margin: 0 0 0.65rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.risk-intel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 0.65rem 1rem;
+}
+
+.risk-intel-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.risk-intel-item .label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.risk-meter.risk-strong {
+  color: var(--success);
+}
+
+.risk-meter.risk-mid {
+  color: #e3b341;
+}
+
+.risk-meter.risk-weak {
+  color: var(--error);
+}
+
+.risk-shock-yes {
+  color: var(--error);
+  font-weight: 600;
+}
+
+.risk-shock-no {
+  color: var(--success);
+}
+
 .model-predictions {
   margin-top: 1.25rem;
   padding-top: 1rem;

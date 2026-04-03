@@ -8,6 +8,7 @@ recomputing features. No synthetic path smoothing or output inertia.
 from __future__ import annotations
 
 import math
+import os
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -35,14 +36,27 @@ from prediction.forecast_intel import (
     infer_volatility_regime_from_context,
 )
 from prediction.forecast_postprocess import market_data_freshness
+from prediction.feature_sanity import audit_feature_row
 from prediction.inference_utils import (
     align_X_to_n_features,
     feature_row_to_matrix,
+    feature_row_to_matrix_with_stats,
     infer_n_features_for_ensemble,
     load_scaler_bundle_from_disk,
     load_training_metadata,
     prediction_matrix_to_dataframe,
     resolve_inference_columns,
+    slice_scaled_X_for_model,
+)
+from prediction.multi_day_consensus import consensus_score_from_snapshots
+from prediction.realism import OUTER_DAILY_ABS_CAP, clip_daily_log_return, daily_log_return_cap
+from prediction.signal_cooldown import cooldown_active, register_actionable_signal
+from prediction.trading_validation import (
+    compose_risk_adjusted_confidence,
+    compute_path_stability_score,
+    compute_trend_confirmation_score,
+    detect_volatility_shock,
+    lr_matrix_chaotic_disagreement,
 )
 from prediction.artifact_audit import (
     evaluate_artifact_bundle,
@@ -308,6 +322,85 @@ class Predictor:
             "_predicted_log_return": r_w,
         }
 
+    def _ensemble_one_step_log_return(
+        self,
+        feat_df: pd.DataFrame,
+        coin: str,
+        models: dict[str, Any],
+        weights: dict[str, float],
+        bundle: dict[str, Any],
+        training_meta: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """One-day clipped ensemble log return from the last row of ``feat_df``."""
+        reg_names = set(list_models())
+        if feat_df is None or feat_df.empty:
+            return {"log_return": 0.0, "direction": 0, "confidence": 0.0, "preds_lr": {}}
+        last = feat_df.iloc[-1]
+        meta = training_meta or {}
+        scaler = bundle.get("scaler")
+        columns = resolve_inference_columns(bundle, last.index)
+        X, _ = feature_row_to_matrix_with_stats(last, columns)
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        if scaler is not None:
+            try:
+                Xs = scaler.transform(X)
+            except Exception:
+                Xs = X
+        else:
+            Xs = X
+        use_per = bool(meta.get("per_model_feature_indices"))
+        n_fm = (
+            len(columns)
+            if use_per
+            else (infer_n_features_for_ensemble(models) or len(columns))
+        )
+        Xs, _ = align_X_to_n_features(
+            Xs, n_fm, allow=settings.prediction.allow_emergency_feature_align
+        )
+        vol = (
+            float(last["ewma_vol_logret_14"])
+            if "ewma_vol_logret_14" in last.index and pd.notna(last["ewma_vol_logret_14"])
+            else 0.02
+        )
+        vol = max(vol, 0.005)
+        p99_hist = meta.get("historical_abs_logret_p99")
+        daily_cap = daily_log_return_cap(
+            vol, historical_abs_logret_p99=float(p99_hist) if p99_hist is not None else None
+        )
+        preds_lr: dict[str, float] = {}
+        for name, model in models.items():
+            if name not in reg_names:
+                continue
+            try:
+                X_m, col_m = slice_scaled_X_for_model(Xs, name, meta, columns)
+                X_df = prediction_matrix_to_dataframe(
+                    X_m,
+                    model_wrapper=model,
+                    training_feature_columns=col_m,
+                )
+                r_raw = float(np.ravel(model.predict(X_df))[0])
+                r = clip_daily_log_return(r_raw, daily_cap, outer_cap=OUTER_DAILY_ABS_CAP)
+                preds_lr[name] = r
+            except Exception:
+                continue
+        if not preds_lr:
+            return {"log_return": 0.0, "direction": 0, "confidence": 0.0, "preds_lr": {}}
+        w_eff = {k: float(weights.get(k, 0.0)) for k in preds_lr}
+        wsum = sum(w_eff.values())
+        if wsum < 1e-12:
+            r_w = float(np.mean(list(preds_lr.values())))
+        else:
+            r_w = float(sum(w_eff[k] / wsum * preds_lr[k] for k in preds_lr))
+        r_w = float(np.clip(r_w, -OUTER_DAILY_ABS_CAP, OUTER_DAILY_ABS_CAP))
+        direction = 1 if r_w > 1e-6 else (-1 if r_w < -1e-6 else 0)
+        conf = _model_agreement_score(list(preds_lr.values()))
+        return {
+            "log_return": r_w,
+            "direction": direction,
+            "confidence": conf,
+            "preds_lr": preds_lr,
+        }
+
     def _feature_context_from_row(self, df: pd.DataFrame) -> dict[str, float]:
         keys = (
             "atr_14",
@@ -422,9 +515,36 @@ class Predictor:
         training_meta = load_training_metadata(coin_dir)
 
         history = df[req].copy()
-        feat_live = build_features(
+        full_feat = build_features(
             history.tail(min(1000, len(history))), include_targets=False, coin=coin
         )
+        feature_sanity_ok = True
+        feature_sanity_issues: list[str] = []
+        if not full_feat.empty:
+            _arow = full_feat.iloc[-1]
+            _acols = resolve_inference_columns(bundle, _arow.index)
+            feature_sanity_ok, feature_sanity_issues = audit_feature_row(_arow, _acols)
+        else:
+            feature_sanity_ok = False
+            feature_sanity_issues.append("empty feature frame")
+
+        consensus_snaps: list[dict[str, Any]] = []
+        min_hist_rows = 72
+        for k in (3, 2, 1):
+            if len(history) - k < min_hist_rows:
+                continue
+            sub = history.iloc[: len(history) - k].copy()
+            fd_k = build_features(sub.tail(min(1000, len(sub))), include_targets=False, coin=coin)
+            if fd_k.empty:
+                continue
+            st = self._ensemble_one_step_log_return(
+                fd_k, coin, models, weights, bundle, training_meta
+            )
+            consensus_snaps.append({"direction": st["direction"], "confidence": st["confidence"]})
+        consensus_score, consensus_reasons = consensus_score_from_snapshots(consensus_snaps)
+        cooldown_block, cooldown_msg = cooldown_active(coin)
+
+        feat_live = full_feat
         live_ix = feat_live.iloc[-1].index if len(feat_live) else pd.Index([])
         bundle_audit = evaluate_artifact_bundle(
             coin_dir,
@@ -475,6 +595,39 @@ class Predictor:
             [float(p["model_log_returns"][m]) for m in sorted(p["model_log_returns"])]
             for p in path_raw
         ]
+        chaotic, chaos_frac = lr_matrix_chaotic_disagreement(lr_matrix)
+        stability_score = compute_path_stability_score(path_raw)
+        forecast_bullish = float(last["predicted_price"]) > current_close
+        hist_vols: list[float] = []
+        if not full_feat.empty and "ewma_vol_logret_14" in full_feat.columns:
+            ev = full_feat["ewma_vol_logret_14"].dropna().astype(float)
+            if len(ev) >= 2:
+                hist_vols = ev.iloc[:-1].tail(30).tolist()
+        cur_vl = (
+            float(full_feat["ewma_vol_logret_14"].iloc[-1])
+            if not full_feat.empty and "ewma_vol_logret_14" in full_feat.columns
+            else float(vol0)
+        )
+        shock, shock_ratio = detect_volatility_shock(cur_vl, hist_vols)
+        adx5 = (
+            full_feat["adx_14"].dropna().astype(float).tail(5).tolist()
+            if not full_feat.empty and "adx_14" in full_feat.columns
+            else []
+        )
+        ema_s = (
+            float(full_feat["ema_20"].iloc[-1])
+            if not full_feat.empty and "ema_20" in full_feat.columns
+            else None
+        )
+        ema_l = (
+            float(full_feat["ema_50"].iloc[-1])
+            if not full_feat.empty and "ema_50" in full_feat.columns
+            else None
+        )
+        trend_confirmation_score = compute_trend_confirmation_score(
+            ema_s, ema_l, adx5, forecast_bullish=forecast_bullish
+        )
+
         implied_ret = (
             (float(last["predicted_price"]) - current_close) / current_close
             if current_close > 0
@@ -510,6 +663,20 @@ class Predictor:
         merged["directional_probabilities"] = dir_probs or {}
         merged["signal_strength_score"] = round(max(0.0, float(sig_strength)), 4)
         merged["volatility_regime"] = infer_volatility_regime_from_context(feature_context)
+        merged["stability_score"] = float(stability_score)
+        merged["consensus_score"] = float(consensus_score)
+        merged["trend_confirmation_score"] = float(trend_confirmation_score)
+        merged["volatility_shock_detected"] = bool(shock)
+        merged["volatility_shock_ratio"] = float(shock_ratio)
+        merged["chaotic_model_disagreement"] = bool(chaotic)
+        merged["chaotic_disagreement_fraction"] = float(chaos_frac)
+        merged["feature_sanity_ok"] = bool(feature_sanity_ok)
+        merged["feature_sanity_issues"] = list(feature_sanity_issues)
+        merged["consensus_reasons"] = list(consensus_reasons)
+        merged["signal_cooldown_active"] = bool(cooldown_block)
+        merged["signal_cooldown_message"] = cooldown_msg
+        if not feature_sanity_ok:
+            merged["degraded_input"] = True
         log_v_hc = float(
             feature_context.get("ewma_vol_logret_14")
             or feature_context.get("rolling_std_logret_14")
@@ -545,6 +712,7 @@ class Predictor:
             twitter_sentiment=feature_context.get("twitter_sentiment"),
             twitter_volume=feature_context.get("twitter_volume"),
             sentiment_diag_out=sentiment_diag,
+            chaotic_model_disagreement=chaotic,
         )
         merged.update(sentiment_diag)
         base_confidence = finalize_forecast_confidence(
@@ -554,12 +722,24 @@ class Predictor:
             vol_regime=str(merged.get("volatility_regime") or "MEDIUM"),
         )
         merged["confidence_score_base"] = round(float(base_confidence), 4)
+        vr_compose = str(merged.get("volatility_regime") or "MEDIUM")
+        risk_adj_base = compose_risk_adjusted_confidence(
+            float(base_confidence),
+            mean_agree,
+            stability_score,
+            consensus_score,
+            trend_confirmation_score,
+            volatility_regime_high=vr_compose.upper() == "HIGH",
+            volatility_shock=shock,
+            chaotic_disagreement=chaotic,
+        )
+        merged["confidence_score_pre_decision_layer"] = round(float(risk_adj_base), 4)
         dec = compute_decision_bundle(
             current_price=current_close,
             final_prediction=float(last["predicted_price"]),
             lower_bound=float(last["lower_bound"]),
             upper_bound=float(last["upper_bound"]),
-            base_confidence=float(base_confidence),
+            base_confidence=float(risk_adj_base),
             mean_path_agreement=mean_agree,
             signal_strength_score=float(sig_strength),
             trend_label=str(trend_for_hc),
@@ -599,13 +779,21 @@ class Predictor:
             "expected_move_pct": float(merged["expected_move_pct"]),
             "risk_reward_ratio": float(merged["risk_reward_ratio"]),
             "trend_label": str(trend_for_hc),
-            "forecast_bullish": float(last["predicted_price"]) > current_close,
+            "forecast_bullish": forecast_bullish,
             "sentiment_alignment": float(merged.get("sentiment_alignment", 0.0)),
             "adx_14": feature_context.get("adx_14"),
+            "consensus_score": float(consensus_score),
+            "stability_score": float(stability_score),
+            "trend_confirmation_score": float(trend_confirmation_score),
+            "volatility_shock_detected": bool(shock),
+            "feature_sanity_failed": not feature_sanity_ok,
+            "signal_cooldown_active": bool(cooldown_block),
         })
         merged["trade_decision"] = str(trade_eval["decision"])
         merged["edge_score"] = float(trade_eval["score"])
         merged["trade_reasons"] = list(trade_eval["reasons"])
+        cd_days = int(os.environ.get("TRADE_COOLDOWN_DAYS", "3"))
+        register_actionable_signal(coin, merged["trade_decision"], cooldown_days=cd_days)
 
         return {
             "coin": coin,
@@ -743,6 +931,7 @@ class Predictor:
                 twitter_sentiment=fc_ctx.get("twitter_sentiment"),
                 twitter_volume=fc_ctx.get("twitter_volume"),
                 sentiment_diag_out=sentiment_fb,
+                chaotic_model_disagreement=bool(diag.get("chaotic_model_disagreement", False)),
             )
             diag_fb_sent = sentiment_fb
             confidence = apply_confidence_penalty_caps(confidence, diag)
@@ -860,6 +1049,10 @@ class Predictor:
             "volatility_level": volatility_level,
             "multi_horizon": multi_horizon,
             "mean_path_agreement": round(mean_agree, 4),
+            "stability_score": float(diag.get("stability_score", 0.0)),
+            "consensus_score": float(diag.get("consensus_score", 0.0)),
+            "trend_confirmation_score": float(diag.get("trend_confirmation_score", 0.0)),
+            "volatility_shock_detected": bool(diag.get("volatility_shock_detected", False)),
             "forecast_volatility": round(vol_start, 8),
             "data_freshness": data_freshness,
             "data_age_hours": data_age_hours,
@@ -893,6 +1086,11 @@ class Predictor:
                 "sentiment_confidence_contribution": float(
                     diag_for_api.get("sentiment_confidence_contribution", 0.0)
                 ),
+                "consensus_score": float(diag_for_api.get("consensus_score", 0.0)),
+                "stability_score": float(diag_for_api.get("stability_score", 0.0)),
+                "trend_confirmation_score": float(diag_for_api.get("trend_confirmation_score", 0.0)),
+                "volatility_shock_detected": bool(diag_for_api.get("volatility_shock_detected", False)),
+                "chaotic_model_disagreement": bool(diag_for_api.get("chaotic_model_disagreement", False)),
             },
             "is_constant_prediction": bool(diag.get("is_constant_prediction", False)),
             "low_variance_warning": bool(diag.get("low_variance_warning", False)),
