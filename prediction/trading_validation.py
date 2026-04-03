@@ -128,9 +128,11 @@ def compose_risk_adjusted_confidence(
     volatility_regime_high: bool,
     volatility_shock: bool,
     chaotic_disagreement: bool,
+    market_regime: str | None = None,
 ) -> float:
     """
     confidence ≈ base × agreement_factor × stability × consensus × trend_confirm;
+    market regime: VOLATILE ×0.75, TRENDING ×1.05, RANGING ×0.96;
     then hard caps on high vol / shock / chaos.
     """
     bc = float(max(0.0, min(1.0, base_confidence)))
@@ -140,6 +142,13 @@ def compose_risk_adjusted_confidence(
     tconf = float(max(0.25, min(1.0, trend_confirmation_score)))
     agree_f = 0.48 + 0.52 * agree
     c = bc * agree_f * stab * cons * tconf
+    mr = str(market_regime or "").strip().upper()
+    if mr == "VOLATILE":
+        c *= 0.75
+    elif mr == "TRENDING":
+        c = min(1.0, c * 1.05)
+    elif mr == "RANGING":
+        c *= 0.96
     c = float(max(0.0, min(1.0, c)))
     if chaotic_disagreement:
         c = min(c, 0.5)

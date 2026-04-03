@@ -128,6 +128,16 @@ class CoinPredictionResponse(BaseModel):
         False,
         description="True when short-term vol exceeds ~1.8× recent average",
     )
+    market_regime: str = Field(
+        "RANGING",
+        description="TRENDING | RANGING | VOLATILE (structure + vol context)",
+    )
+    market_regime_confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Classifier confidence in the current regime label",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -370,6 +380,16 @@ class ForecastPathResponse(BaseModel):
         False,
         description="True when short-term vol exceeds ~1.8× recent average",
     )
+    market_regime: str = Field(
+        "RANGING",
+        description="TRENDING | RANGING | VOLATILE (structure + vol context)",
+    )
+    market_regime_confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Classifier confidence in the current regime label",
+    )
 
 
 class RefreshResponse(BaseModel):
@@ -584,6 +604,8 @@ def create_app() -> FastAPI:
             consensus_score=float(path_result.get("consensus_score", 0.0)),
             trend_confirmation_score=float(path_result.get("trend_confirmation_score", 0.0)),
             volatility_shock_detected=bool(path_result.get("volatility_shock_detected", False)),
+            market_regime=str(path_result.get("market_regime", "RANGING")),
+            market_regime_confidence=float(path_result.get("market_regime_confidence", 0.0)),
         )
 
     @api_router.post("/refresh/{coin}", response_model=RefreshResponse)
@@ -770,6 +792,8 @@ def create_app() -> FastAPI:
             consensus_score=float(diag.get("consensus_score", 0.0)),
             trend_confirmation_score=float(diag.get("trend_confirmation_score", 0.0)),
             volatility_shock_detected=bool(diag.get("volatility_shock_detected", False)),
+            market_regime=str(diag.get("market_regime", "RANGING")),
+            market_regime_confidence=float(diag.get("market_regime_confidence", 0.0)),
         )
 
     # Dashboard (defined before mount so it takes precedence)

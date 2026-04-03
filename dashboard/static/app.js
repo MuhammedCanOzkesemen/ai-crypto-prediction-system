@@ -253,6 +253,21 @@
       return { text: pct + '%', tier: tier };
     }
 
+    var mrBlock = document.getElementById('market-regime-block');
+    var mrLabel = document.getElementById('market-regime-label');
+    var mrConf = document.getElementById('market-regime-conf');
+    if (mrBlock && mrLabel && mrConf) {
+      var reg = data.market_regime != null ? String(data.market_regime).toUpperCase() : 'RANGING';
+      mrLabel.textContent = reg.replace(/_/g, ' ');
+      var rc =
+        typeof data.market_regime_confidence === 'number' && !isNaN(data.market_regime_confidence)
+          ? (data.market_regime_confidence * 100).toFixed(0) + '% confidence'
+          : '—';
+      mrConf.textContent = rc;
+      mrLabel.className = 'market-regime-label regime-' + reg.toLowerCase();
+      mrBlock.classList.remove('hidden');
+    }
+
     var riBlock = document.getElementById('risk-intel-block');
     var rs = document.getElementById('risk-stability');
     var rc = document.getElementById('risk-consensus');

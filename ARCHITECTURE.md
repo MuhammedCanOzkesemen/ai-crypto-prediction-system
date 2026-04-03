@@ -1,201 +1,158 @@
-# Cryptocurrency Prediction Platform — Architecture & Module Design
+# Architecture — AI Crypto Trading Intelligence System
 
-## 1. High-Level Overview
+This document describes how the repository is structured, how data moves through the stack, and how validation and trade decisions are composed. It reflects the **current** implementation (ensemble regressors on tabular features, recursive horizon forecast, FastAPI, static dashboard).
 
-The system is a **modular prediction pipeline**: raw data is ingested → features are engineered → multiple ML models train and predict → an ensemble produces final outputs → an API serves results → a dashboard visualizes them.
+---
+
+## 1. High-Level Data Flow
 
 ```
-[Data Sources] → data/ → features/ → models/ → prediction/ → api/ → dashboard/
-                     ↑         ↑         ↑          ↑
-                   utils/ ←────────────────────────────
+[data/price_fetcher, data_refresh]  →  OHLCV (+ stored parquet features)
+        ↓
+[features/feature_builder]  →  indicators, targets, optional Twitter columns
+        ↓
+[scripts/train_pipeline]  →  scaled matrices, RF/XGB/LGBM artifacts, metadata
+        ↓
+[prediction/predictor]  →  recursive path, confidence, regime, trade tiers
+        ↓
+[api/app.py]  →  JSON responses
+        ↓
+[dashboard/]  →  static HTML/JS/CSS
+```
+
+Supporting cross-cutting packages: **`utils/`** (config, constants, logging), **`evaluation/`** (metrics, backtest helpers), **`tests/`** (unit tests).
+
+---
+
+## 2. Directory and Module Map
+
+| Path | Role |
+|------|------|
+| `data/` | Historical fetch, refresh orchestration, optional `twitter_sentiment` integration points. |
+| `features/` | `feature_builder.py` builds ML-ready frames; `schema.py` versions the training column contract. |
+| `models/` | Wrappers for Random Forest, XGBoost, LightGBM; `feature_subsets.py` per-model column views; registry for discovery. |
+| `prediction/` | Inference, path recursion, intelligence, validation, regime, trade filter, cooldown. See §4–§6. |
+| `api/` | FastAPI app, Pydantic response models, routes under `/predictions`, `/api/*`, static dashboard mount. |
+| `dashboard/` | Client UI: forecast table, chart (Plotly), regime, risk strip, trade signal. |
+| `scripts/train_pipeline.py` | End-to-end train: fetch → features → fit → evaluate → write artifacts. |
+| `evaluation/` | Metric computation and backtest scripts (consumes saved features / labels). |
+
+---
+
+## 3. Feature and Training Contract
+
+- **Input to training:** OHLCV DataFrames; `build_features(..., coin=..., include_targets=True)` adds targets and optional Twitter fields.  
+- **Schema:** `FEATURE_SCHEMA_VERSION` in `features/schema.py`; `training_metadata.json` per coin stores column order, optional `per_model_feature_indices`, historical return tails for realism checks.  
+- **Targets:** Single-step **next-day log return**; multi-day **price path** is produced at inference by chaining predictions and updating synthetic OHLCV rows (`prediction/recursive_forecast.py`).
+
+---
+
+## 4. Prediction Pipeline (Detailed)
+
+### 4.1 Entry point
+
+`Predictor.predict_from_latest_features(coin)`:
+
+1. Loads coin feature parquet (must include OHLCV columns).  
+2. Loads models + scaler bundle + `training_metadata.json`.  
+3. Builds `full_feat` = `build_features` on recent history tail.  
+4. **Feature sanity** (`prediction/feature_sanity.py`) on the latest row.  
+5. **Multi-day consensus** — three truncated histories; `_ensemble_one_step_log_return` per cutoff (`prediction/multi_day_consensus.py`).  
+6. **Cooldown** read (`prediction/signal_cooldown.py`).  
+7. **Market regime** — `detect_market_regime(full_feat)` (`prediction/market_regime.py`).  
+8. **Recursive forecast** — 14 steps, daily caps, per-step model agreement (`prediction/realism.py`, `recursive_forecast.py`).  
+9. From the path: **stability score**, **LR-matrix chaotic disagreement**, **volatility shock** vs EWMA history, **trend confirmation** (EMA20/50, ADX persistence).  
+10. **Financial confidence** — `compute_financial_confidence` in `forecast_intel.py` (includes optional chaotic penalty, Twitter sentiment block).  
+11. **Finalize** then **risk-adjusted confidence** — `compose_risk_adjusted_confidence` in `trading_validation.py` (regime: VOLATILE ×0.75, TRENDING ×1.05, RANGING ×0.96; caps for shock/high vol/chaos).  
+12. **Decision layer** — `decision_layer.compute_decision_bundle` (legacy `trade_signal`, edge from structural formula, `confidence_after_decision`).  
+13. **Trade filter** — `trade_filter.evaluate_trade_opportunity` (strict `trade_decision`, product-based `edge_score` overwrite on diagnostics).  
+14. **Cooldown register** when `trade_decision` is `STRONG_BUY` or `WEAK_BUY` and cooldown not already active.
+
+### 4.2 Recursive forecast
+
+- Each step: rebuild features from rolling synthetic + real history, align to scaler, slice per model if metadata specifies indices, predict clipped log return, update prices.  
+- Diagnostics: clip saturation, emergency align flags, path variance signals (`prediction/forecast_path_quality.py`).
+
+---
+
+## 5. Market Regime and Adaptive Behavior
+
+**Module:** `prediction/market_regime.py`
+
+- **VOLATILE** — Current EWMA log-vol vs recent window shows a spike (default ratio ≥ ~1.75× trailing values).  
+- **TRENDING** — ADX above threshold and trend consistency supports a directional market (not volatile-first).  
+- **RANGING** — Low ADX and mid range position, or default transition.
+
+**Outputs:** `market_regime`, `market_regime_confidence` (0–1).
+
+**Confidence:** `compose_risk_adjusted_confidence` applies regime multipliers after the core product.
+
+**Trade filter:**
+
+- **TRENDING** — Slightly lower agreement bar for strong tier; slightly relaxed consensus/stability/trend thresholds for strong layers.  
+- **RANGING** — **STRONG_BUY** disabled; **WEAK_BUY** requires tighter confidence, agreement, stability, consensus, and move.  
+- **VOLATILE** — Edge score ×0.7; **NO_TRADE** unless an **extreme** confidence bundle is met; only narrow **WEAK_BUY** if that gate passes.
+
+---
+
+## 6. Validation Layers (Summary)
+
+| Layer | Source | Effect |
+|-------|--------|--------|
+| Feature sanity | Latest row audit | Forces degraded input + trade NO_TRADE path |
+| Multi-day consensus | 3× single-step directions | Score + reasons; trade thresholds |
+| Path stability | Variance + sign flips along 14d path | Risk-adjusted confidence + weak gates |
+| Trend confirmation | EMA cross + ADX persistence | Risk-adjusted confidence + strong layers |
+| Volatility shock | EWMA vs history | Shock flag, STRONG block, confidence cap |
+| Chaotic disagreement | Sign split across models per day | Extra financial confidence penalty + cap 0.5 |
+| Regime | ADX / vol / structure | Confidence multipliers + adaptive trade rules |
+| Cooldown | Disk JSON per coin | NO_TRADE with reason while active |
+
+---
+
+## 7. Decision Logic (Two Tracks)
+
+1. **Legacy decision layer** — Uses expected move strength, R:R, alignment, adaptive thresholds; produces `trade_signal` and structural `edge_score` before trade filter overwrites displayed edge.  
+2. **Strict trade engine** — `STRONG_BUY` / `WEAK_BUY` / `NO_TRADE` with regime-aware rules; `trade_reasons` explain failures and downgrades.
+
+Consumers should treat **`trade_decision`** as the primary strict label for research and UI; **`trade_signal`** remains for backward compatibility.
+
+---
+
+## 8. API Surface
+
+- `GET /predictions/{coin}` — Compact prediction + diagnostics subset.  
+- `GET /api/forecast-path/{coin}` — Full path, multi-horizon summary, extended diagnostics.  
+- `POST /api/refresh/{coin}` — Force OHLCV + feature rebuild.  
+- `GET /api/chart/{coin}`, `GET /api/evaluation/{coin}` — Chart and metric summaries.
+
+Response models include: regime fields, stability, consensus, trend confirmation, shock flag, Twitter sentiment diagnostics, trade decision, edge score.
+
+---
+
+## 9. Artifacts and Caching
+
+- **Models / scaler:** `artifacts/models/{Coin}/`  
+- **Features parquet:** configured `features_dir` (often `artifacts/features/`).  
+- **Twitter cache:** under artifact root `cache/twitter_sentiment/`.  
+- **Signal cooldown:** `cache/signal_cooldown/{slug}.json`.
+
+---
+
+## 10. Testing
+
+`tests/` covers decision layer, forecast intel disagreement behavior, signal contracts, trade filter, trading validation helpers, and market regime classification. Run:
+
+```bash
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 ---
 
-## 2. Folder Structure
+## 11. Design Principles
 
-```
-Bitcoin/
-├── data/                    # Data ingestion, storage, schemas
-├── features/                # Feature engineering & technical indicators
-├── models/                  # LSTM, RandomForest, XGBoost implementations
-├── prediction/              # Ensemble logic & prediction orchestration
-├── api/                     # REST/FastAPI service for predictions
-├── dashboard/               # Frontend (e.g. React/Streamlit) for visualization
-├── utils/                   # Shared helpers, config, logging
-├── config/                  # Environment & model configs (optional; can live in utils)
-├── tests/                   # Unit and integration tests
-├── scripts/                 # One-off or CLI scripts (e.g. train, backtest)
-├── ARCHITECTURE.md          # This document
-└── README.md
-```
+- **One-way dependencies:** `features` does not import `prediction`; `api` calls `prediction` only at the edge.  
+- **Versioned schema:** Feature or target changes bump `FEATURE_SCHEMA_VERSION` and require retraining.  
+- **Graceful degradation:** Missing Twitter token, failed sanity, or partial history should yield neutral or safe defaults, not crashes.
 
----
-
-## 3. Module Responsibilities
-
-### 3.1 `data/`
-
-**Purpose:** Single source of truth for all ingested and stored data.
-
-- **Ingestion**
-  - Fetch historical OHLCV (and volume) for the top 10 coins from a provider (e.g. CoinGecko, Binance, CryptoCompare).
-  - Optional: news headlines/API and social metrics (e.g. Reddit/Twitter APIs or third-party sentiment APIs).
-- **Storage**
-  - Raw series (e.g. CSV/Parquet or SQLite/Postgres) with clear schema: symbol, timestamp, open, high, low, close, volume.
-  - Separate tables or files for news/social if used.
-- **Contracts**
-  - Define canonical coin list (Bitcoin, Ethereum, BNB, XRP, Solana, Dogecoin, Cardano, Pepe, Polkadot, Chainlink) and date ranges.
-- **Submodules (conceptual)**
-  - `sources/`: adapters per provider (e.g. `coingecko.py`, `news_api.py`).
-  - `storage/`: read/write to local DB or files.
-  - `schemas/`: data models or table definitions for raw and validated data.
-
-**Outcome:** Clean, timestamped series and optional sentiment datasets ready for feature engineering.
-
----
-
-### 3.2 `features/`
-
-**Purpose:** Transform raw data into model-ready feature matrices and targets.
-
-- **Technical indicators (per coin)**
-  - RSI, MACD (and signal/histogram), Bollinger Bands (upper/lower/width), EMA (e.g. 12/26/50), and volatility (e.g. ATR, rolling std).
-- **Targets**
-  - Next 1-day and multi-day (e.g. 14-day) price/return; binary “upward movement” for probability; optional volatility for ranges.
-- **Sentiment (if available)**
-  - Aggregate news/social sentiment into daily (or sub-daily) scores and merge with price index.
-- **Pipeline**
-  - One entry point that: loads data from `data/` → computes all indicators → builds train/validation/test windows → outputs DataFrames or arrays with aligned features and targets for 14-day horizon.
-
-**Outcome:** Feature matrices and target vectors (and metadata for date/symbol) consumed by `models/` and `prediction/`.
-
----
-
-### 3.3 `models/`
-
-**Purpose:** Implement and train the three model families; expose a unified “predict” interface.
-
-- **LSTM**
-  - Time-series model (e.g. PyTorch/TensorFlow or Keras): sequence of features → future price/return and optionally uncertainty. Handles variable-length history (e.g. last 30–60 days).
-- **Random Forest**
-  - Tabular features (indicators + lags) → point prediction and optional prediction intervals (e.g. quantile forests or bootstrap).
-- **XGBoost**
-  - Same tabular setup; native support for uncertainty (e.g. quantile objective or distribution output) for ranges.
-- **Interface**
-  - Each model module: `fit(features, targets)`, `predict(features)` returning at least: point forecast, optional lower/upper range, and optionally raw scores for “up” probability.
-- **Persistence**
-  - Save/load weights or pickled models (paths configurable via `utils` config).
-
-**Outcome:** Three trained models that, given the same feature snapshot, each produce: predicted price (or return), range, and optionally probability of upward movement.
-
----
-
-### 3.4 `prediction/`
-
-**Purpose:** Orchestrate ensemble and produce the four required outputs per coin.
-
-- **Ensemble**
-  - Combine LSTM, RandomForest, and XGBoost outputs (e.g. mean or weighted average for point prediction; min/max or quantile average for ranges).
-- **Outputs per coin (14-day horizon)**
-  - **Predicted price** — ensemble point forecast (e.g. price at day 14 or path).
-  - **Price range** — lower/upper from ensemble ranges (and/or quantiles).
-  - **Probability of upward movement** — from classifier head or thresholding returns (e.g. proportion of models voting “up” or average probability).
-  - **Confidence score** — derived from model agreement, prediction interval width, or explicit uncertainty head.
-- **Orchestration**
-  - Load latest features from `features/`, call each model in `models/`, aggregate in `prediction/`, return structured result (e.g. dict or Pydantic model) for the API.
-
-**Outcome:** One clear “run prediction” function that returns, for each of the 10 coins, the four required fields for the next 14 days.
-
----
-
-### 3.5 `api/`
-
-**Purpose:** Expose predictions and minimal metadata to the dashboard and external clients.
-
-- **Endpoints (suggested)**
-  - `GET /coins` — list supported coins (top 10).
-  - `GET /predictions` — all coins’ predictions (14-day).
-  - `GET /predictions/{symbol}` — single-coin prediction + optional history.
-  - `GET /history/{symbol}` — historical prices (and optionally past predictions) for charts.
-- **Implementation**
-  - FastAPI (or Flask) app; calls into `prediction/` to get current predictions and into `data/` or `features/` for history.
-- **Performance**
-  - Cache predictions (e.g. TTL 1 hour) so dashboard and users don’t retrain on every request.
-
-**Outcome:** REST API that the dashboard can call to drive selector, tables, and charts.
-
----
-
-### 3.6 `dashboard/`
-
-**Purpose:** Simple, professional UI for selection, predictions, and charts.
-
-- **Capabilities**
-  - **Select cryptocurrency** — dropdown or list of the 10 coins.
-  - **View predictions** — table or cards: predicted price, range, P(up), confidence per coin (and for selected coin).
-  - **Price charts** — historical price (and optionally prediction overlay) for selected coin; 14-day horizon clearly marked.
-- **Tech options**
-  - React + Chart.js/Recharts + Tailwind, or Streamlit for a fast, data-focused UI. Static build can call `api/` via configurable base URL.
-- **Data flow**
-  - All data from API; no direct DB or model access.
-
-**Outcome:** Users can pick a coin, see 14-day predictions and confidence, and inspect history and prediction range on a chart.
-
----
-
-### 3.7 `utils/`
-
-**Purpose:** Shared code and configuration to keep other modules DRY and consistent.
-
-- **Config**
-  - Coin list, date ranges, API keys (via env), paths for data and model artifacts, hyperparameters (or references to config files).
-- **Logging**
-  - Common logger and (optional) structured logs for training and API.
-- **Helpers**
-  - Date handling, symbol normalization, safe division for indicators, serialization of predictions.
-- **Constants**
-  - Symbol-to-id mapping, indicator defaults (e.g. RSI period, EMA spans).
-
-**Outcome:** One place for config and shared utilities; all modules import from here as needed.
-
----
-
-## 4. Data Flow Summary
-
-1. **data/**  
-   Fetches and stores OHLCV + volume; optionally news/social. Exposes reader API for date range and symbols.
-
-2. **features/**  
-   Reads from `data/`, computes RSI, MACD, Bollinger Bands, EMA, volatility; builds targets for 14-day horizon and “up” probability. Writes feature matrices and metadata.
-
-3. **models/**  
-   Load features and targets from `features/` (or from disk). Train LSTM, RandomForest, XGBoost; save artifacts. Expose `predict(features)` per model.
-
-4. **prediction/**  
-   Load latest features; call each model; ensemble → predicted price, range, P(up), confidence per coin; return structured output.
-
-5. **api/**  
-   On request, call `prediction/` (with caching) and optionally `data/` or `features/` for history; return JSON.
-
-6. **dashboard/**  
-   Call API for list of coins, predictions, and history; render selector, prediction panel, and charts.
-
----
-
-## 5. Cross-Cutting Concerns
-
-- **Config & secrets:** All keys and environment-specific settings in `utils` (or `config/`); no hardcoding in `data/` or `api/`.
-- **Logging:** Centralized in `utils`; each module logs at appropriate level (e.g. debug in feature computation, info in API).
-- **Testing:** `tests/` with unit tests per module (e.g. indicator math, ensemble logic, API contract) and optional integration test against a small dataset.
-- **Reproducibility:** Fixed train/validation/test splits and seeds; version data and model artifacts if needed (e.g. by date or run id).
-
----
-
-## 6. Scalability and Production Notes
-
-- **Modularity:** Each folder can be a package; dependencies flow one way (e.g. `prediction` depends on `models` and `features`, not the reverse).
-- **Scaling:** Data and feature jobs can be run on a schedule (cron or pipeline); training can be triggered separately; API and dashboard scale independently (stateless).
-- **Deployment:** API and dashboard can be containerized (Docker); data and model storage can be local or cloud (S3, RDS) as configured in `utils`.
-
-This structure satisfies the required folders (data, features, models, prediction, api, dashboard, utils), keeps a clear separation of concerns, and supports the 10 coins, 14-day horizon, four output types, multiple data sources, technical indicators, three model types, and ensemble, with a simple professional dashboard and production-friendly layout.
+This architecture is intended to stay modular as you add backtesting harnesses or execution adapters without rewriting the core feature or model contracts.

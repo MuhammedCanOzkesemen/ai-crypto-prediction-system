@@ -58,8 +58,13 @@ def evaluate_trade_opportunity(prediction_output: dict[str, Any]) -> dict[str, A
 
     Optional: sentiment_alignment (-1/0/1), adx_14 (float),
       consensus_score, stability_score, trend_confirmation_score,
-      volatility_shock_detected, feature_sanity_failed, signal_cooldown_active.
+      volatility_shock_detected, feature_sanity_failed, signal_cooldown_active,
+      market_regime (TRENDING|RANGING|VOLATILE), market_regime_confidence.
     """
+    market_regime = str(prediction_output.get("market_regime") or "RANGING").strip().upper()
+    if market_regime not in ("TRENDING", "RANGING", "VOLATILE"):
+        market_regime = "RANGING"
+
     conf = float(prediction_output.get("confidence_score") or 0.0)
     agree = float(prediction_output.get("mean_path_agreement") or 0.0)
     sig = float(prediction_output.get("signal_strength_score") or 0.0)
@@ -108,6 +113,10 @@ def evaluate_trade_opportunity(prediction_output: dict[str, Any]) -> dict[str, A
         reasons.append("Hard filter: confidence < 0.35 or mean path agreement < 0.30")
         return {"decision": "NO_TRADE", "score": float(round(score, 6)), "reasons": reasons}
 
+    if market_regime == "VOLATILE":
+        score *= 0.7
+        reasons.append("Regime VOLATILE: edge score scaled ×0.7")
+
     # Optional modifiers (capped)
     if vol == "HIGH":
         score *= 0.88
@@ -128,9 +137,22 @@ def evaluate_trade_opportunity(prediction_output: dict[str, Any]) -> dict[str, A
     pup = float(probs.get("up", 0.0))
     pdn = float(probs.get("down", 0.0))
 
+    volatile_extreme = (
+        conf >= 0.72
+        and agree >= 0.78
+        and sig >= 0.58
+        and pup >= 0.62
+        and stability_score >= 0.55
+        and consensus_score >= 0.55
+    )
+    if market_regime == "VOLATILE" and not volatile_extreme:
+        reasons.append("Regime VOLATILE: no trade without extreme confidence across core metrics")
+        return {"decision": "NO_TRADE", "score": float(round(score, 6)), "reasons": reasons}
+
+    agree_bar_strong = 0.56 if market_regime == "TRENDING" else 0.60
     strong_numeric = (
         conf >= 0.55
-        and agree >= 0.60
+        and agree >= agree_bar_strong
         and sig >= 0.50
         and pup >= 0.60
         and em >= 0.03
@@ -138,25 +160,34 @@ def evaluate_trade_opportunity(prediction_output: dict[str, Any]) -> dict[str, A
         and bullish
         and _trend_bullish_ok(str(trend))
     )
+    sc_need, st_need, tr_need = 0.70, 0.58, 0.56
+    if market_regime == "TRENDING":
+        sc_need, st_need, tr_need = 0.64, 0.54, 0.52
     strong_layers = (
-        consensus_score >= 0.70
-        and stability_score >= 0.58
-        and trend_confirmation_score >= 0.56
+        consensus_score >= sc_need
+        and stability_score >= st_need
+        and trend_confirmation_score >= tr_need
         and not shock
     )
 
-    if strong_numeric and strong_layers:
+    allow_strong = market_regime not in ("RANGING", "VOLATILE")
+    if market_regime == "RANGING" and strong_numeric and strong_layers:
+        reasons.append("Regime RANGING: STRONG_BUY blocked (range-bound context)")
+
+    if allow_strong and strong_numeric and strong_layers:
         reasons.insert(0, "Strong long: numeric gates + consensus/stability/trend confirmation")
+        if market_regime == "TRENDING":
+            reasons.append("Regime TRENDING: slightly relaxed agreement / confirmation bars")
         return {"decision": "STRONG_BUY", "score": score, "reasons": reasons}
 
     if strong_numeric and not strong_layers:
         if shock:
             reasons.append("Downgrade: volatility shock — STRONG_BUY blocked")
-        elif consensus_score < 0.70:
+        elif consensus_score < sc_need:
             reasons.append("Downgrade: multi-day consensus insufficient for STRONG_BUY")
-        elif stability_score < 0.58:
+        elif stability_score < st_need:
             reasons.append("Downgrade: forecast path stability insufficient for STRONG_BUY")
-        elif trend_confirmation_score < 0.56:
+        elif trend_confirmation_score < tr_need:
             reasons.append("Downgrade: trend confirmation below threshold for STRONG_BUY")
 
     weak_ok = (
@@ -169,8 +200,29 @@ def evaluate_trade_opportunity(prediction_output: dict[str, Any]) -> dict[str, A
         and stability_score >= 0.40
         and consensus_score >= 0.38
     )
+    if market_regime == "RANGING":
+        weak_ok = (
+            weak_ok
+            and conf >= 0.48
+            and agree >= 0.55
+            and stability_score >= 0.48
+            and consensus_score >= 0.45
+            and em >= 0.018
+        )
+    if market_regime == "VOLATILE" and volatile_extreme:
+        weak_ok = (
+            weak_ok
+            and em >= 0.025
+            and rr >= 1.25
+            and stability_score >= 0.50
+        )
+
     if weak_ok:
         reasons.insert(0, "Weak scalp: minimum quality bar met for long")
+        if market_regime == "RANGING":
+            reasons.append("Regime RANGING: tight weak-only conditions")
+        elif market_regime == "VOLATILE":
+            reasons.append("Regime VOLATILE: weak entry only after extreme-confidence gate")
         return {"decision": "WEAK_BUY", "score": score, "reasons": reasons}
 
     reasons.append("No trade: strong or weak long criteria not satisfied")

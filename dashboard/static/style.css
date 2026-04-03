@@ -268,6 +268,58 @@ body {
   margin-left: -1.15rem;
 }
 
+.market-regime-block {
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+.market-regime-block h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.regime-row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.market-regime-label {
+  display: inline-block;
+  padding: 0.35rem 0.65rem;
+  border-radius: var(--radius);
+  font-weight: 600;
+  font-size: 0.8rem;
+  letter-spacing: 0.03em;
+}
+
+.market-regime-label.regime-trending {
+  background: rgba(63, 185, 80, 0.2);
+  color: var(--success);
+  border: 1px solid rgba(63, 185, 80, 0.45);
+}
+
+.market-regime-label.regime-ranging {
+  background: rgba(210, 153, 34, 0.18);
+  color: #e3b341;
+  border: 1px solid rgba(210, 153, 34, 0.4);
+}
+
+.market-regime-label.regime-volatile {
+  background: rgba(248, 81, 73, 0.15);
+  color: var(--error);
+  border: 1px solid rgba(248, 81, 73, 0.45);
+}
+
+.market-regime-conf.muted {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
 .risk-intel-block {
   margin-top: 1rem;
   padding-top: 1rem;

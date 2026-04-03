@@ -48,6 +48,7 @@ from prediction.inference_utils import (
     resolve_inference_columns,
     slice_scaled_X_for_model,
 )
+from prediction.market_regime import detect_market_regime
 from prediction.multi_day_consensus import consensus_score_from_snapshots
 from prediction.realism import OUTER_DAILY_ABS_CAP, clip_daily_log_return, daily_log_return_cap
 from prediction.signal_cooldown import cooldown_active, register_actionable_signal
@@ -544,6 +545,10 @@ class Predictor:
         consensus_score, consensus_reasons = consensus_score_from_snapshots(consensus_snaps)
         cooldown_block, cooldown_msg = cooldown_active(coin)
 
+        regime_info = detect_market_regime(full_feat)
+        market_regime_label = str(regime_info.get("regime", "RANGING"))
+        market_regime_conf = float(regime_info.get("market_regime_confidence", 0.5))
+
         feat_live = full_feat
         live_ix = feat_live.iloc[-1].index if len(feat_live) else pd.Index([])
         bundle_audit = evaluate_artifact_bundle(
@@ -675,6 +680,8 @@ class Predictor:
         merged["consensus_reasons"] = list(consensus_reasons)
         merged["signal_cooldown_active"] = bool(cooldown_block)
         merged["signal_cooldown_message"] = cooldown_msg
+        merged["market_regime"] = market_regime_label
+        merged["market_regime_confidence"] = round(market_regime_conf, 4)
         if not feature_sanity_ok:
             merged["degraded_input"] = True
         log_v_hc = float(
@@ -732,6 +739,7 @@ class Predictor:
             volatility_regime_high=vr_compose.upper() == "HIGH",
             volatility_shock=shock,
             chaotic_disagreement=chaotic,
+            market_regime=market_regime_label,
         )
         merged["confidence_score_pre_decision_layer"] = round(float(risk_adj_base), 4)
         dec = compute_decision_bundle(
@@ -788,6 +796,8 @@ class Predictor:
             "volatility_shock_detected": bool(shock),
             "feature_sanity_failed": not feature_sanity_ok,
             "signal_cooldown_active": bool(cooldown_block),
+            "market_regime": market_regime_label,
+            "market_regime_confidence": float(market_regime_conf),
         })
         merged["trade_decision"] = str(trade_eval["decision"])
         merged["edge_score"] = float(trade_eval["score"])
@@ -1049,6 +1059,8 @@ class Predictor:
             "volatility_level": volatility_level,
             "multi_horizon": multi_horizon,
             "mean_path_agreement": round(mean_agree, 4),
+            "market_regime": str(diag.get("market_regime", "RANGING")),
+            "market_regime_confidence": float(diag.get("market_regime_confidence", 0.0)),
             "stability_score": float(diag.get("stability_score", 0.0)),
             "consensus_score": float(diag.get("consensus_score", 0.0)),
             "trend_confirmation_score": float(diag.get("trend_confirmation_score", 0.0)),
@@ -1091,6 +1103,8 @@ class Predictor:
                 "trend_confirmation_score": float(diag_for_api.get("trend_confirmation_score", 0.0)),
                 "volatility_shock_detected": bool(diag_for_api.get("volatility_shock_detected", False)),
                 "chaotic_model_disagreement": bool(diag_for_api.get("chaotic_model_disagreement", False)),
+                "market_regime": str(diag_for_api.get("market_regime", "RANGING")),
+                "market_regime_confidence": float(diag_for_api.get("market_regime_confidence", 0.0)),
             },
             "is_constant_prediction": bool(diag.get("is_constant_prediction", False)),
             "low_variance_warning": bool(diag.get("low_variance_warning", False)),
