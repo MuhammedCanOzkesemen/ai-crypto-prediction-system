@@ -5,9 +5,12 @@ and multi-horizon summaries derived from the forecast path and feature context.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
+
+from utils.constants import VOL_REGIME_LOGBOUND_HIGH, VOL_REGIME_LOGBOUND_LOW
 
 # Trend: z = predicted return / daily vol (rolling); thresholds in "sigmas"
 TREND_Z_STRONG = 2.0
@@ -34,6 +37,340 @@ CONFIDENCE_MAX = 0.85
 VOL_REF = 0.035
 # Relative model spread (max-min)/|mean| above this → low confidence
 SPREAD_REF = 0.14
+
+# Reference scales for financial confidence (log-return variance / error / EWMA vol)
+_FIN_VAR_REF = 0.00025
+_FIN_ERR_REF = 0.05
+_FIN_VOL_REF = 0.04
+
+
+def apply_confidence_penalty_caps(confidence: float, diag: dict[str, Any]) -> float:
+    """Post-process financial confidence from path-level honesty flags."""
+    c = float(confidence)
+    if diag.get("sanity_extreme"):
+        c = min(c, 0.35)
+    if diag.get("is_constant_prediction"):
+        c = min(c, 0.12)
+    elif diag.get("low_variance_warning"):
+        c = min(c, 0.32)
+    if diag.get("degraded_input"):
+        c = min(c, 0.38)
+    return float(max(0.0, min(1.0, c)))
+
+
+def compute_signal_strength_score(
+    current_price: float,
+    final_price: float,
+    feature_context: dict[str, float] | None,
+) -> float:
+    """
+    0..1 composite: horizon move vs volatility, ADX, and 7d momentum magnitude.
+    """
+    fc = feature_context or {}
+    if current_price is None or current_price <= 0:
+        return 0.0
+    ret = (float(final_price) - float(current_price)) / float(current_price)
+    vol = max(float(fc.get("ewma_vol_logret_14") or 0.02), 1e-8)
+    z_move = abs(ret) / max(vol * math.sqrt(14.0), 1e-8)
+    adx_part = min(1.0, (float(fc.get("adx_14") or 0.0) / 45.0) ** 0.9)
+    mom_part = min(1.0, abs(float(fc.get("return_7d") or 0.0)) / 0.06)
+    raw = 0.42 * min(1.0, z_move / 2.2) + 0.33 * adx_part + 0.25 * mom_part
+    return float(max(0.0, min(1.0, raw)))
+
+
+def compute_high_conviction(
+    *,
+    signal_strength: float,
+    mean_path_agreement: float,
+    feature_context: dict[str, float] | None,
+    implied_horizon_return: float,
+    directional_probs: dict[str, float] | None,
+    trend_label: str = "NEUTRAL",
+) -> bool:
+    """
+    High conviction: strong ADX, meaningful 7d momentum, path agrees with momentum direction,
+    models agree, signal strength sufficient, optional classifier not contradicting.
+    Range-bound (NEUTRAL) 14d trend never qualifies as high conviction.
+    """
+    tl = (trend_label or "NEUTRAL").strip().upper()
+    if tl == "NEUTRAL" or tl == "SIDEWAYS":
+        return False
+    fc = feature_context or {}
+    adx = float(fc.get("adx_14") or 0.0)
+    ts = adx / 100.0
+    mom7 = float(fc.get("return_7d") or 0.0)
+    strong_trend = ts >= 0.28
+    strong_mom = abs(mom7) >= 0.018
+    sign_r = 1 if implied_horizon_return > 0.004 else -1 if implied_horizon_return < -0.004 else 0
+    sign_m = 1 if mom7 > 0.006 else -1 if mom7 < -0.006 else 0
+    aligned = sign_r != 0 and sign_m == sign_r
+    agree = mean_path_agreement >= 0.70
+    clf_ok = True
+    if directional_probs and sign_r != 0:
+        pup = float(directional_probs.get("up", 0.0))
+        pdn = float(directional_probs.get("down", 0.0))
+        if sign_r > 0 and pup < pdn + 0.04:
+            clf_ok = False
+        if sign_r < 0 and pdn < pup + 0.04:
+            clf_ok = False
+    return bool(
+        strong_trend
+        and strong_mom
+        and aligned
+        and agree
+        and signal_strength >= 0.40
+        and clf_ok
+    )
+
+
+def volatility_regime_label(vol_regime_encoded: float | None) -> str:
+    """Map encoded 0/1/2 to LOW/MEDIUM/HIGH (fallback MEDIUM if unknown)."""
+    if vol_regime_encoded is None:
+        return "MEDIUM"
+    try:
+        v = int(round(float(vol_regime_encoded)))
+    except (TypeError, ValueError):
+        return "MEDIUM"
+    if v <= 0:
+        return "LOW"
+    if v == 1:
+        return "MEDIUM"
+    return "HIGH"
+
+
+def infer_volatility_regime_from_context(feature_context: dict[str, float] | None) -> str:
+    """
+    Always returns LOW | MEDIUM | HIGH using vol_regime_encoded, then log-vol features,
+    then rolling return volatility.
+    """
+    fc = feature_context or {}
+    vre = fc.get("vol_regime_encoded")
+    if vre is not None:
+        try:
+            xf = float(vre)
+            if math.isfinite(xf):
+                return volatility_regime_label(xf)
+        except (TypeError, ValueError):
+            pass
+    for key in ("ewma_vol_logret_30", "rolling_std_logret_14", "ewma_vol_logret_14"):
+        x = fc.get(key)
+        if x is None:
+            continue
+        try:
+            xv = float(x)
+            if math.isfinite(xv) and xv >= 0:
+                if xv < VOL_REGIME_LOGBOUND_LOW:
+                    return "LOW"
+                if xv < VOL_REGIME_LOGBOUND_HIGH:
+                    return "MEDIUM"
+                return "HIGH"
+        except (TypeError, ValueError):
+            continue
+    rv = fc.get("rolling_volatility_14")
+    if rv is not None:
+        try:
+            r = float(rv)
+            if math.isfinite(r) and r >= 0:
+                if r < 0.015:
+                    return "LOW"
+                if r < 0.04:
+                    return "MEDIUM"
+                return "HIGH"
+        except (TypeError, ValueError):
+            pass
+    return "MEDIUM"
+
+
+def _trend_label_from_z(z: float) -> str:
+    """Discrete 14d trend from standardized score (NEUTRAL = range-bound)."""
+    if z >= TREND_Z_STRONG:
+        return "STRONG UP"
+    if z >= TREND_Z_MILD:
+        return "UP"
+    if z <= -TREND_Z_STRONG:
+        return "STRONG DOWN"
+    if z <= -TREND_Z_MILD:
+        return "DOWN"
+    return "NEUTRAL"
+
+
+def classify_trend_from_forecast_path(
+    spot_close: float,
+    path_rows: list[dict[str, Any]],
+    *,
+    log_vol_daily: float | None = None,
+) -> tuple[str, float]:
+    """
+    14d trend from **unrounded** ensemble path: cumulative log return vs spot and average
+    daily log drift, scaled by a log-return volatility prior (EWMA/rolling).
+    """
+    if spot_close <= 0 or not path_rows:
+        return "NEUTRAL", 0.0
+    final_p = float(path_rows[-1]["predicted_price"])
+    cum_log = math.log(max(final_p, 1e-30) / max(float(spot_close), 1e-30))
+    n = len(path_rows)
+    v = max(float(log_vol_daily if log_vol_daily is not None else 0.018), 1e-6)
+    z_cum = cum_log / max(v * math.sqrt(float(n)), 1e-10)
+    avg_step = cum_log / float(n)
+    z_slope = avg_step / max(v, 1e-10)
+    z_eff = float(np.clip(0.58 * z_cum + 0.42 * z_slope, -3.5, 3.5))
+    return _trend_label_from_z(z_eff), z_eff
+
+
+def classifier_uncertainty_score(directional_probs: dict[str, float] | None) -> float:
+    """0 = firm directional view, 1 = very uncertain (missing classifier treated as uncertain)."""
+    if not directional_probs:
+        return 0.62
+    p = {k: float(v) for k, v in directional_probs.items()}
+    m = max(p.get("up", 0.0), p.get("down", 0.0), p.get("neutral", 0.0))
+    neu = p.get("neutral", 0.0)
+    return float(max(0.0, min(1.0, (1.0 - m) + 0.35 * neu)))
+
+
+def finalize_forecast_confidence(
+    confidence: float,
+    *,
+    mean_path_agreement: float,
+    directional_probs: dict[str, float] | None,
+    vol_regime: str,
+) -> float:
+    """
+    Enforce consistency: high disagreement + uncertain classifier caps confidence;
+    HIGH vol regime trims tail confidence.
+    """
+    c = float(max(0.0, min(1.0, confidence)))
+    agree = float(max(0.0, min(1.0, mean_path_agreement)))
+    cu = classifier_uncertainty_score(directional_probs)
+
+    if agree < 0.50:
+        c *= 0.62 + 0.38 * (agree / 0.50)
+    if agree < 0.42 and cu >= 0.48:
+        c = min(c, 0.49)
+    elif agree < 0.50 and cu >= 0.55:
+        c = min(c, 0.52)
+    if str(vol_regime).upper() == "HIGH":
+        c *= 0.90
+    return float(max(0.0, min(1.0, c)))
+
+
+def compute_financial_confidence(
+    path_agreement_scores: list[float],
+    lr_matrix: list[list[float]],
+    metrics_by_model: dict[str, dict[str, float]],
+    forecast_vol_start: float,
+    *,
+    forecast_quality: str = "production",
+    fallback_mode: bool = False,
+    guardrail_cumulative: bool = False,
+    clip_saturation_fraction: float = 0.0,
+    exact_feature_match: bool = True,
+    artifact_mode: str = "production",
+    signal_strength: float = 0.0,
+    directional_probs: dict[str, float] | None = None,
+    implied_horizon_log_return: float = 0.0,
+    vol_regime_encoded: float | None = None,
+) -> float:
+    """
+    Confidence in [0, 1] from metrics, volatility, and model spread — heavily penalized
+    when forecasts are degraded, guardrails fire, or outputs are clip-saturated together.
+    """
+    vars_per_step: list[float] = []
+    for row in lr_matrix:
+        if len(row) >= 2:
+            vars_per_step.append(float(np.var(np.array(row, dtype=np.float64))))
+    mean_var = float(np.mean(vars_per_step)) if vars_per_step else 0.0
+    # Very low variance across models is suspicious (shared failure / clip collapse), not strength.
+    if mean_var < 1e-8 and len(lr_matrix) >= 2:
+        inv_model_var = 0.35
+    else:
+        inv_model_var = 1.0 / (1.0 + mean_var / max(_FIN_VAR_REF, 1e-12))
+        inv_model_var = float(max(0.0, min(1.0, inv_model_var)))
+
+    err_vals: list[float] = []
+    for m in metrics_by_model.values():
+        for k in ("mae", "rmse"):
+            if m.get(k) is not None:
+                e = float(m[k])
+                if e > 1e-12:
+                    err_vals.append(e)
+                break
+    mean_err = float(np.mean(err_vals)) if err_vals else _FIN_ERR_REF
+    inv_error = 1.0 / (1.0 + mean_err / max(_FIN_ERR_REF, 1e-12))
+    inv_error = float(max(0.0, min(1.0, inv_error)))
+
+    v = max(float(forecast_vol_start), 1e-8)
+    inv_volatility = 1.0 / (1.0 + v / max(_FIN_VOL_REF, 1e-12))
+    inv_volatility = float(max(0.0, min(1.0, inv_volatility)))
+
+    agree = float(np.mean(path_agreement_scores)) if path_agreement_scores else 0.5
+    agree = max(0.0, min(1.0, agree))
+
+    cu = classifier_uncertainty_score(directional_probs)
+
+    # Agreement drives the blend weight — low agreement should not be masked by error/vol terms.
+    agree_w = 0.22 if mean_var >= 1e-9 else 0.18
+    w_var, w_err, w_vol = 0.26, 0.26, 0.26
+    w_sum = w_var + w_err + w_vol + agree_w
+    w_var, w_err, w_vol, agree_w = w_var / w_sum, w_err / w_sum, w_vol / w_sum, agree_w / w_sum
+
+    combined = (
+        w_var * inv_model_var
+        + w_err * inv_error
+        + w_vol * inv_volatility
+        + agree_w * agree
+    )
+    combined = float(max(0.0, min(1.0, combined)))
+
+    if agree < 0.50:
+        combined *= 0.58 + 0.42 * (agree / 0.50)
+    if cu >= 0.55:
+        combined *= 0.88 + 0.12 * max(0.0, (1.0 - cu) / 0.45)
+
+    ss = max(0.0, min(1.0, float(signal_strength)))
+    if ss >= 0.50 and agree >= 0.68 and cu <= 0.48:
+        combined = min(1.0, combined * (1.0 + 0.04 * (ss - 0.50) / 0.50))
+    if (
+        ss >= 0.55
+        and agree >= 0.74
+        and cu <= 0.42
+        and vol_regime_encoded is not None
+        and float(vol_regime_encoded) <= 1.25
+    ):
+        combined = min(1.0, combined * 1.025)
+
+    if directional_probs:
+        pup = float(directional_probs.get("up", 0.0))
+        pdn = float(directional_probs.get("down", 0.0))
+        pneu = float(directional_probs.get("neutral", 0.0))
+        ilr = float(implied_horizon_log_return)
+        if ilr > 0.0018 and pup >= 0.40 and pup >= pdn and agree >= 0.58:
+            combined = min(1.0, combined * 1.022)
+        elif ilr < -0.0018 and pdn >= 0.40 and pdn >= pup and agree >= 0.58:
+            combined = min(1.0, combined * 1.022)
+        elif pneu > 0.52 or max(pup, pdn, pneu) < 0.36:
+            combined *= 0.90
+        elif (ilr > 0.0025 and pdn > pup + 0.10) or (ilr < -0.0025 and pup > pdn + 0.10):
+            combined *= 0.88
+
+    if vol_regime_encoded is not None and float(vol_regime_encoded) >= 1.85:
+        combined *= 0.86
+
+    if forecast_quality != "production":
+        combined *= 0.52
+    if artifact_mode == "legacy":
+        combined *= 0.48
+    elif artifact_mode == "degraded":
+        combined *= 0.88
+    if fallback_mode:
+        combined *= 0.68
+    if not exact_feature_match:
+        combined *= 0.72
+    if guardrail_cumulative:
+        combined *= 0.78
+    if clip_saturation_fraction > 0.35:
+        combined *= 0.62
+
+    return float(max(0.0, min(1.0, combined)))
 
 
 def compute_confidence_score(
@@ -109,7 +446,7 @@ def _label_from_score(z: float) -> str:
         return "STRONG DOWN"
     if z <= -TREND_Z_MILD:
         return "DOWN"
-    return "SIDEWAYS"
+    return "NEUTRAL"
 
 
 def classify_trend_label(
@@ -122,7 +459,7 @@ def classify_trend_label(
     inertia_beta: float = 0.52,
 ) -> tuple[str, float]:
     """
-    STRONG UP / UP / SIDEWAYS / DOWN / STRONG DOWN from predicted return,
+    STRONG UP / UP / NEUTRAL / DOWN / STRONG DOWN from predicted return,
     recent 7d return, and volatility. Blends with previous_trend_score for stability.
     Returns (label, effective_score).
     """
@@ -159,6 +496,9 @@ def build_prediction_explanation(
     confidence_score: float,
     mean_path_agreement: float,
     model_weights: dict[str, float],
+    *,
+    directional_probs: dict[str, float] | None = None,
+    implied_horizon_log_return: float | None = None,
 ) -> str:
     """
     Short, human-readable rationale (single paragraph). Rule-based from indicators
@@ -201,6 +541,24 @@ def build_prediction_explanation(
     elif mean_path_agreement > 0.8:
         parts.append("models largely agree across the path")
 
+    if directional_probs:
+        pup = float(directional_probs.get("up", 0.0))
+        pdn = float(directional_probs.get("down", 0.0))
+        pneu = float(directional_probs.get("neutral", 0.0))
+        dom = max(pup, pdn, pneu)
+        dom_l = "up" if dom == pup and pup >= pdn and pup >= pneu else (
+            "down" if dom == pdn else "neutral"
+        )
+        parts.append(
+            f"the directional classifier leans {dom_l} (≈{dom * 100:.0f}% probability vs other buckets)"
+        )
+        if implied_horizon_log_return is not None and math.isfinite(implied_horizon_log_return):
+            ilr = float(implied_horizon_log_return)
+            if ilr > 0.002 and pdn > pup + 0.08:
+                parts.append("the classifier distribution conflicts with the upward 14d path—down-weight conviction")
+            elif ilr < -0.002 and pup > pdn + 0.08:
+                parts.append("the classifier distribution conflicts with the downward 14d path—down-weight conviction")
+
     if confidence_score >= 0.58:
         parts.append("overall confidence in this outlook is moderately strong for this product band")
     elif confidence_score <= 0.32:
@@ -209,10 +567,11 @@ def build_prediction_explanation(
     trend_phrase = {
         "STRONG UP": "The 14-day trajectory is strongly upward versus spot.",
         "UP": "The outlook is modestly upward over the two-week window.",
+        "NEUTRAL": "Price action is expected to be range-bound over the horizon.",
         "SIDEWAYS": "Price action is expected to be range-bound over the horizon.",
         "DOWN": "The outlook is modestly downward over the two-week window.",
         "STRONG DOWN": "The 14-day trajectory is strongly downward versus spot.",
-    }.get(trend_label, "The trend classification is neutral.")
+    }.get(trend_label, "The 14-day trend versus spot is assessed as neutral.")
 
     core = "; ".join(parts[:5])
     if core:

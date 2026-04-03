@@ -18,7 +18,9 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
-from features.feature_builder import get_feature_columns, TARGET_PRICE_COLUMNS
+from sklearn.preprocessing import RobustScaler
+
+from features.feature_builder import TARGET_LOG_RETURN_1D, get_feature_columns
 from models.model_registry import get_model, list_models
 from utils.config import settings
 from utils.logging_setup import get_logger, configure_root_logger
@@ -26,7 +28,6 @@ from utils.logging_setup import get_logger, configure_root_logger
 logger = get_logger(__name__)
 
 CLOSE_COL = "close"
-HORIZON_DAYS = 14
 
 
 @dataclass
@@ -65,30 +66,33 @@ def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 0.0 if ss_tot < 1e-12 else float(1 - ss_res / ss_tot)
 
 
-def _directional_accuracy(y_true: np.ndarray, y_pred: np.ndarray, close: np.ndarray) -> float:
-    pred_dir = (y_pred > close).astype(np.int64)
-    true_dir = (y_true > close).astype(np.int64)
-    return float(np.mean(pred_dir == true_dir)) if len(y_true) > 0 else 0.0
+def _directional_accuracy_log(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    if len(y_true) == 0:
+        return 0.0
+    st = np.sign(y_true)
+    sp = np.sign(y_pred)
+    m = st != 0
+    return float(np.mean(st[m] == sp[m])) if np.any(m) else 0.5
 
 
 def _get_X_y_close(feature_df: pd.DataFrame) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """Extract X, y (n, 14) multi-output, and close."""
+    """Extract X, y next-day log return, and close."""
     feat_cols = get_feature_columns(include_targets=False)
     avail = [c for c in feat_cols if c in feature_df.columns]
-    target_cols = [c for c in TARGET_PRICE_COLUMNS if c in feature_df.columns]
-    if not avail or len(target_cols) != HORIZON_DAYS:
+    if not avail or TARGET_LOG_RETURN_1D not in feature_df.columns:
         return None, None, None
     X = feature_df[avail].astype(np.float64).dropna(axis=0, how="any")
     if X.empty:
         return None, None, None
-    valid_idx = X.index.intersection(feature_df[target_cols].dropna(how="any").index)
+    ys = feature_df[TARGET_LOG_RETURN_1D].astype(np.float64)
+    valid_idx = X.index.intersection(ys.dropna(how="any").index)
     if len(valid_idx) == 0:
         return None, None, None
-    y = feature_df.loc[valid_idx, target_cols].astype(np.float64).values
+    y = ys.loc[valid_idx].values
     close = (
         feature_df.loc[valid_idx, CLOSE_COL].astype(np.float64).values
         if CLOSE_COL in feature_df.columns
-        else feature_df.loc[valid_idx, target_cols[-1]].astype(np.float64).values  # fallback
+        else None
     )
     return X.loc[valid_idx].values, y, close
 
@@ -136,24 +140,25 @@ def run_backtest(
         test_end = train_end + config.test_size
 
         X_train, X_test = X[train_start:train_end], X[test_start:test_end]
-        y_train = y[train_start:train_end]  # (n_train, 14)
-        y_test_full = y[test_start:test_end]  # (n_test, 14)
-        y_test_14 = y_test_full[:, HORIZON_DAYS - 1]
-        close_test = close[test_start:test_end]
+        y_train = y[train_start:train_end]
+        y_test = y[test_start:test_end]
+
+        scaler = RobustScaler()
+        X_train_s = scaler.fit_transform(X_train)
+        X_test_s = scaler.transform(X_test)
 
         fold_metrics: dict[str, dict[str, float]] = {}
 
         for name in model_names:
             try:
                 model = get_model(name)
-                model.fit(X_train, y_train)
-                pred_full = model.predict(X_test)  # (n_test, 14)
-                y_pred_14 = pred_full[:, HORIZON_DAYS - 1] if pred_full.ndim > 1 else np.ravel(pred_full)
+                model.fit(X_train_s, y_train)
+                y_pred = np.ravel(model.predict(X_test_s))
                 fold_metrics[name] = {
-                    "mae": _mae(y_test_14, y_pred_14),
-                    "rmse": _rmse(y_test_14, y_pred_14),
-                    "r2": _r2(y_test_14, y_pred_14),
-                    "directional_accuracy": _directional_accuracy(y_test_14, y_pred_14, close_test),
+                    "mae": _mae(y_test, y_pred),
+                    "rmse": _rmse(y_test, y_pred),
+                    "r2": _r2(y_test, y_pred),
+                    "directional_accuracy": _directional_accuracy_log(y_test, y_pred),
                 }
                 for k, v in fold_metrics[name].items():
                     all_metrics[name][k].append(v)

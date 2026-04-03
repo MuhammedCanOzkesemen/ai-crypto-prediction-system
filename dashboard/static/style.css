@@ -473,3 +473,24 @@ body {
   background: var(--accent);
   border-radius: 2px;
 }
+
+.quality-strip {
+  margin: 0.75rem 0 0;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.quality-strip strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.quality-strip.quality-warn {
+  border-color: #9e6a03;
+  background: rgba(158, 106, 3, 0.12);
+}

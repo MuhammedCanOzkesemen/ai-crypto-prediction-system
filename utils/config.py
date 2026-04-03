@@ -96,6 +96,16 @@ class ModelRegistrySettings:
     experiment_name: str = os.environ.get("MLFLOW_EXPERIMENT", "crypto_forecast")
 
 
+class PredictionSettings:
+    """
+    Inference-time behavior. Emergency feature width align helps legacy artifacts
+    but marks forecasts as degraded; disable for strict production-only parity.
+    """
+    allow_emergency_feature_align: bool = os.environ.get(
+        "ALLOW_EMERGENCY_FEATURE_ALIGN", "0"
+    ).lower() in ("1", "true", "yes")
+
+
 # -----------------------------------------------------------------------------
 # Aggregated config (single import point)
 # -----------------------------------------------------------------------------
@@ -106,6 +116,7 @@ class Settings:
     api: APISettings = APISettings()
     data: DataSettings = DataSettings()
     training: TrainingSettings = TrainingSettings()
+    prediction: PredictionSettings = PredictionSettings()
     database: DatabaseSettings = DatabaseSettings()
     cache: CacheSettings = CacheSettings()
     model_registry: ModelRegistrySettings = ModelRegistrySettings()

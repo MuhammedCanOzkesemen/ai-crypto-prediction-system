@@ -18,9 +18,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
+from typing import Any
 
 from data.data_refresh import get_last_refresh_time, refresh_data_if_needed
+from prediction.artifact_audit import forecast_audit_api_subset
 from prediction.predictor import Predictor
+from prediction.price_format import price_decimal_places, round_price
 from utils.config import settings
 from utils.constants import get_supported_coins_list
 from utils.logging_setup import get_logger, configure_root_logger
@@ -41,11 +44,35 @@ class CoinPredictionResponse(BaseModel):
     coin: str = Field(..., description="Coin display name")
     model_predictions: dict[str, float] = Field(..., description="Per-model price predictions")
     average_prediction: float = Field(..., description="Ensemble average prediction")
-    lower_bound: float = Field(..., description="Lower bound (min of model predictions)")
-    upper_bound: float = Field(..., description="Upper bound (max of model predictions)")
+    lower_bound: float = Field(..., description="Lower confidence bound (volatility-scaled)")
+    upper_bound: float = Field(..., description="Upper confidence bound (volatility-scaled)")
     model_agreement_score: float = Field(..., ge=0, le=1, description="Agreement across models")
     horizon_days: int = Field(14, description="Forecast horizon in days")
     generated_at: str = Field(..., description="ISO timestamp when prediction was generated")
+    forecast_quality: str = Field("degraded", description="production | degraded | legacy-fallback")
+    artifact_mode: str = Field("legacy", description="production | degraded | legacy")
+    schema_match: bool = False
+    scaler_used: bool = False
+    used_scaler: bool = False
+    exact_feature_match: bool = False
+    fallback_mode: bool = True
+    forecast_validity: str = Field("questionable", description="invalid | questionable | valid")
+    forecast_quality_score: float = Field(0.0, ge=0.0, le=1.0)
+    confidence_score: float = Field(0.0, ge=0.0, le=1.0, description="Path-level financial confidence")
+    confidence_composition_reference: str = Field("", description="How confidence_score is composed")
+    high_conviction: bool = Field(False, description="Strong trend + momentum + model agreement (+ classifier)")
+    signal_strength_score: float = Field(0.0, ge=0.0, le=1.0)
+    directional_probabilities: dict[str, float] = Field(
+        default_factory=dict,
+        description="Optional down/neutral/up from directional head",
+    )
+    volatility_regime: str = Field("UNKNOWN", description="LOW | MEDIUM | HIGH from log-vol regime")
+    realism_guardrail_triggered: bool = False
+    forecast_audit: dict[str, Any] = Field(default_factory=dict)
+    forecast_diagnostics: dict[str, Any] = Field(default_factory=dict)
+    is_constant_prediction: bool = False
+    low_variance_warning: bool = False
+    degraded_input: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -61,6 +88,9 @@ class ForecastDayItem(BaseModel):
     forecast_date: str
     forecast_timestamp: str | None = None
     predicted_price: float
+    predicted_log_return: float | None = None
+    predicted_return: float | None = None
+    volatility: float | None = None
     lower_bound: float
     upper_bound: float
     model_predictions: dict[str, float]
@@ -76,8 +106,8 @@ class ForecastPathSummary(BaseModel):
     average_forecast_price: float
     trend_direction_14d: str
     trend_label: str = Field(
-        "SIDEWAYS",
-        description="STRONG UP | UP | SIDEWAYS | DOWN | STRONG DOWN",
+        "NEUTRAL",
+        description="STRONG UP | UP | NEUTRAL | DOWN | STRONG DOWN",
     )
 
 
@@ -90,6 +120,37 @@ class HorizonSnapshot(BaseModel):
     upper_bound: float | None = None
     implied_return_vs_spot: float | None = None
     agreement_score: float | None = None
+
+
+def _raise_if_prediction_unavailable(
+    predictor: Predictor,
+    match: str,
+    features_dir: Path,
+) -> None:
+    """
+    Raise HTTPException with structured detail when forecast/predictions fail.
+    Scaler missing alone does not trigger this (inference falls back to raw features).
+    """
+    features_path = features_dir / f"{match.replace(' ', '_')}_features.parquet"
+    err = predictor.get_last_forecast_error() or {}
+    code = str(err.get("code", "prediction_failed"))
+    message = str(err.get("message", "Prediction could not be completed."))
+    hint = err.get("hint")
+    detail: dict[str, str] = {
+        "error": code,
+        "message": message,
+        "coin": match,
+    }
+    if hint is not None and str(hint).strip():
+        detail["hint"] = str(hint)
+    if not features_path.exists():
+        detail["error"] = "no_feature_file"
+        detail["message"] = f"Feature file not found: {features_path.name}"
+        detail["hint"] = (
+            f"Run `python scripts/train_pipeline.py --coin {match}` or POST /api/refresh/{match}"
+        )
+        raise HTTPException(status_code=404, detail=detail)
+    raise HTTPException(status_code=503, detail=detail)
 
 
 def _data_freshness(latest_market_ts: str | None) -> tuple[str, str | None]:
@@ -136,8 +197,8 @@ class ForecastPathResponse(BaseModel):
     forecast_path: list[ForecastDayItem]
     summary: ForecastPathSummary
     evaluation: dict | None = None
-    confidence_score: float = Field(0.0, ge=0.0, le=0.85, description="Composite AI confidence (capped)")
-    trend_label: str = Field("SIDEWAYS", description="Classified trend vs spot and volatility")
+    confidence_score: float = Field(0.0, ge=0.0, le=1.0, description="Composite confidence [0,1]")
+    trend_label: str = Field("NEUTRAL", description="Classified 14d trend vs spot (path-based)")
     explanation: str = Field("", description="Human-readable forecast rationale")
     model_weights: dict[str, float] = Field(default_factory=dict, description="Metric-weighted ensemble weights")
     volatility_level: str = Field("UNKNOWN", description="LOW | MEDIUM | HIGH | UNKNOWN")
@@ -152,6 +213,53 @@ class ForecastPathResponse(BaseModel):
         le=1.0,
         description="Model agreement on final horizon day (day 14)",
     )
+    forecast_quality: str = Field(
+        "degraded",
+        description="production | degraded | legacy-fallback",
+    )
+    artifact_mode: str = Field("legacy", description="production | degraded | legacy")
+    schema_match: bool = Field(False, description="Disk schema + columns + live feature index aligned")
+    scaler_used: bool = Field(False, description="Scaler bundle applied successfully at inference")
+    used_scaler: bool = Field(False, description="Whether RobustScaler bundle was applied")
+    exact_feature_match: bool = Field(
+        False,
+        description="Training feature names fully present; no emergency width align",
+    )
+    fallback_mode: bool = Field(
+        True,
+        description="True when not full production artifact parity",
+    )
+    forecast_validity: str = Field("questionable", description="invalid | questionable | valid")
+    forecast_quality_score: float = Field(0.0, ge=0.0, le=1.0)
+    confidence_composition_reference: str = Field(
+        "",
+        description="How confidence_score is composed (documentation string)",
+    )
+    realism_guardrail_triggered: bool = Field(
+        False,
+        description="Cumulative log-return path was scaled to a volatility/historical cap",
+    )
+    forecast_audit: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Artifact tier, schema versions, feature match ratio",
+    )
+    forecast_diagnostics: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Sanity check, clip saturation, align flags",
+    )
+    is_constant_prediction: bool = Field(
+        False,
+        description="True if path is flat (invalid as directional forecast)",
+    )
+    low_variance_warning: bool = Field(False, description="Unusually low path variance")
+    degraded_input: bool = Field(False, description="High missing-feature fill or bad align")
+    high_conviction: bool = Field(
+        False,
+        description="Strong ADX/momentum aligned with forecast + agreement (+ classifier)",
+    )
+    signal_strength_score: float = Field(0.0, ge=0.0, le=1.0)
+    directional_probabilities: dict[str, float] = Field(default_factory=dict)
+    volatility_regime: str = Field("UNKNOWN", description="LOW | MEDIUM | HIGH | UNKNOWN")
 
 
 class RefreshResponse(BaseModel):
@@ -260,16 +368,7 @@ def create_app() -> FastAPI:
         features_dir = settings.training.features_dir
         path_result = predictor.forecast_path(match, features_dir=features_dir)
         if path_result is None:
-            features_path = features_dir / f"{match.replace(' ', '_')}_features.parquet"
-            if not features_path.exists():
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Feature file not found for {match}. Run train_pipeline or POST /api/refresh/{match}.",
-                )
-            raise HTTPException(
-                status_code=503,
-                detail=f"Forecast path not available for {match}. Retrain with train_pipeline to enable 14-day path.",
-            )
+            _raise_if_prediction_unavailable(predictor, match, features_dir)
         now = datetime.now(timezone.utc).isoformat()
         latest_ts = path_result.get("latest_market_timestamp")
         freshness_status = str(path_result.get("data_freshness") or "unknown")
@@ -318,13 +417,35 @@ def create_app() -> FastAPI:
             summary=ForecastPathSummary(**path_result["summary"]),
             evaluation=evaluation,
             confidence_score=float(path_result.get("confidence_score", 0.0)),
-            trend_label=str(path_result.get("trend_label", "SIDEWAYS")),
+            trend_label=str(path_result.get("trend_label") or "NEUTRAL"),
             explanation=str(path_result.get("explanation", "")),
             model_weights=dict(path_result.get("model_weights") or {}),
             volatility_level=str(path_result.get("volatility_level", "UNKNOWN")),
             multi_horizon=multi_horizon,
             mean_path_agreement=float(path_result.get("mean_path_agreement", 0.0)),
             model_agreement_score=float(path_result.get("model_agreement_score", 0.0)),
+            forecast_quality=str(path_result.get("forecast_quality", "degraded")),
+            artifact_mode=str(path_result.get("artifact_mode", "legacy")),
+            schema_match=bool(path_result.get("schema_match", False)),
+            scaler_used=bool(path_result.get("scaler_used", False)),
+            used_scaler=bool(path_result.get("used_scaler", False)),
+            exact_feature_match=bool(path_result.get("exact_feature_match", False)),
+            fallback_mode=bool(path_result.get("fallback_mode", True)),
+            forecast_validity=str(path_result.get("forecast_validity", "questionable")),
+            forecast_quality_score=float(path_result.get("forecast_quality_score") or 0.0),
+            confidence_composition_reference=str(
+                path_result.get("confidence_composition_reference") or ""
+            ),
+            realism_guardrail_triggered=bool(path_result.get("realism_guardrail_triggered", False)),
+            forecast_audit=dict(path_result.get("forecast_audit") or {}),
+            forecast_diagnostics=dict(path_result.get("forecast_diagnostics") or {}),
+            is_constant_prediction=bool(path_result.get("is_constant_prediction", False)),
+            low_variance_warning=bool(path_result.get("low_variance_warning", False)),
+            degraded_input=bool(path_result.get("degraded_input", False)),
+            high_conviction=bool(path_result.get("high_conviction", False)),
+            signal_strength_score=float(path_result.get("signal_strength_score") or 0.0),
+            directional_probabilities=dict(path_result.get("directional_probabilities") or {}),
+            volatility_regime=str(path_result.get("volatility_regime") or "UNKNOWN"),
         )
 
     @api_router.post("/refresh/{coin}", response_model=RefreshResponse)
@@ -368,7 +489,9 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail="Feature file missing date/close columns")
         df = df[["date", "close"]].dropna().tail(days)
         dates = df["date"].astype(str).tolist()
-        closes = df["close"].astype(float).round(6).tolist()
+        ref = float(df["close"].iloc[-1]) if len(df) > 0 else 1.0
+        d = price_decimal_places(ref)
+        closes = [round(float(c), d) for c in df["close"].astype(float)]
         last_date = df["date"].iloc[-1] if len(df) > 0 else None
         latest_market_date = None
         if last_date is not None:
@@ -437,33 +560,49 @@ def create_app() -> FastAPI:
         features_dir = settings.training.features_dir
         result = predictor.predict_from_latest_features(match, features_dir=features_dir)
         if result is None:
-            features_path = features_dir / f"{match.replace(' ', '_')}_features.parquet"
-            if not features_path.exists():
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Feature file not found for {match}. Run train_pipeline or POST /api/refresh/{match}.",
-                )
-            models_dir = settings.training.models_dir
-            coin_models = models_dir / match.replace(" ", "_")
-            if not coin_models.exists():
-                raise HTTPException(
-                    status_code=503,
-                    detail=f"No trained models found for {match}. Run train_pipeline first.",
-                )
-            raise HTTPException(
-                status_code=503,
-                detail=f"Prediction failed for {match}. Check feature file and model files.",
-            )
+            _raise_if_prediction_unavailable(predictor, match, features_dir)
         now = datetime.now(timezone.utc).isoformat()
+        diag = result.get("_forecast_diagnostics") or {}
+        cref = float(result.get("_current_close") or 0)
+        pref = cref if cref > 0 else max(abs(float(result["average_prediction"])), 1e-30)
         return CoinPredictionResponse(
             coin=result["coin"],
-            model_predictions=result["predictions"],
-            average_prediction=result["average_prediction"],
-            lower_bound=result["lower_bound"],
-            upper_bound=result["upper_bound"],
+            model_predictions={k: round_price(float(v), pref) for k, v in result["predictions"].items()},
+            average_prediction=round_price(float(result["average_prediction"]), pref),
+            lower_bound=round_price(float(result["lower_bound"]), pref),
+            upper_bound=round_price(float(result["upper_bound"]), pref),
             model_agreement_score=result["model_agreement_score"],
             horizon_days=result["horizon_days"],
             generated_at=now,
+            forecast_quality=str(diag.get("forecast_quality", "degraded")),
+            artifact_mode=str(diag.get("artifact_mode", "legacy")),
+            schema_match=bool(diag.get("schema_match", False)),
+            scaler_used=bool(diag.get("used_scaler", False)),
+            used_scaler=bool(diag.get("used_scaler", False)),
+            exact_feature_match=bool(diag.get("exact_feature_match", False)),
+            fallback_mode=bool(diag.get("fallback_mode", True)),
+            forecast_validity=str(diag.get("forecast_validity", "questionable")),
+            forecast_quality_score=float(diag.get("forecast_quality_score") or 0.0),
+            confidence_score=float(diag.get("confidence_score") or 0.0),
+            confidence_composition_reference=str(diag.get("confidence_composition_reference") or ""),
+            high_conviction=bool(diag.get("high_conviction", False)),
+            signal_strength_score=float(diag.get("signal_strength_score") or 0.0),
+            directional_probabilities=dict(diag.get("directional_probabilities") or {}),
+            volatility_regime=str(diag.get("volatility_regime") or "UNKNOWN"),
+            realism_guardrail_triggered=bool(diag.get("realism_guardrail_cumulative", False)),
+            forecast_audit=forecast_audit_api_subset(diag.get("forecast_audit") or {}),
+            forecast_diagnostics={
+                "used_emergency_width_align": bool(diag.get("used_emergency_width_align")),
+                "scaler_transform_failed": bool(diag.get("scaler_transform_failed")),
+                "clip_saturation_step_fraction": float(diag.get("clip_saturation_step_fraction", 0.0)),
+                "sanity_check": diag.get("sanity_check") or {},
+                "step0_raw_logret_by_model": diag.get("step0_raw_logret_by_model") or {},
+                "model_horizon_variance_raw": diag.get("model_horizon_variance_raw") or {},
+                "max_missing_feature_fill_ratio": float(diag.get("max_missing_feature_fill_ratio", 0.0)),
+            },
+            is_constant_prediction=bool(diag.get("is_constant_prediction", False)),
+            low_variance_warning=bool(diag.get("low_variance_warning", False)),
+            degraded_input=bool(diag.get("degraded_input", False)),
         )
 
     # Dashboard (defined before mount so it takes precedence)

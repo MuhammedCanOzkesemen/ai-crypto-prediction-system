@@ -36,14 +36,16 @@
     errorEl.classList.remove('hidden');
   }
 
-  /** Adaptive formatting for large vs micro-price coins (Bitcoin vs PEPE) */
+  /** Adaptive formatting for large vs micro-price coins (Bitcoin vs PEPE / SHIB) */
   function formatPrice(n, referencePrice) {
     if (typeof n !== 'number' || isNaN(n)) return '—';
     const ref = referencePrice != null && referencePrice > 0 ? referencePrice : Math.abs(n) || 1;
     if (ref >= 1e6) return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
     if (ref >= 1) return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    if (ref >= 1e-4) return n.toFixed(6);
-    return n < 0.0001 ? n.toExponential(2) : n.toFixed(6);
+    if (ref >= 0.01) return n.toLocaleString(undefined, { minimumFractionDigits: 4, maximumFractionDigits: 6 });
+    var logr = Math.log10(Math.max(ref, 1e-30));
+    var frac = Math.min(14, Math.max(8, 4 - Math.floor(logr)));
+    return n.toFixed(frac);
   }
 
   function formatNumber(n) {
@@ -79,10 +81,12 @@
   }
 
   function trendDisplay(trendLabel) {
-    var label = (trendLabel || '').toString().trim().toUpperCase();
+    var display = (trendLabel != null && String(trendLabel).trim() !== '') ? trendLabel : 'NEUTRAL';
+    var label = String(display).trim().toUpperCase();
     var arrows = {
       'STRONG UP': '↑↑',
       'UP': '↑',
+      'NEUTRAL': '→',
       'SIDEWAYS': '→',
       'DOWN': '↓',
       'STRONG DOWN': '↓↓',
@@ -91,10 +95,10 @@
     var cls = 'trend-sideways';
     if (label === 'STRONG UP') cls = 'trend-strong-up';
     else if (label === 'UP') cls = 'trend-up';
-    else if (label === 'SIDEWAYS') cls = 'trend-sideways';
+    else if (label === 'NEUTRAL' || label === 'SIDEWAYS') cls = 'trend-sideways';
     else if (label === 'DOWN') cls = 'trend-down';
     else if (label === 'STRONG DOWN') cls = 'trend-strong-down';
-    return { text: arrow + ' ' + (trendLabel || '—'), className: cls };
+    return { text: arrow + ' ' + display, className: cls };
   }
 
   function setConfidenceUI(score) {
@@ -206,6 +210,33 @@
         typeof data.mean_path_agreement === 'number'
           ? formatPercent(data.mean_path_agreement * 100)
           : '—';
+    }
+
+    var qStrip = document.getElementById('pred-quality-strip');
+    if (qStrip) {
+      var am = data.artifact_mode || '—';
+      var fq = data.forecast_quality || '—';
+      var sm = data.schema_match === true ? 'schema OK' : data.schema_match === false ? 'schema mismatch' : '—';
+      var fv = data.forecast_validity || '—';
+      var fqs =
+        typeof data.forecast_quality_score === 'number' && !isNaN(data.forecast_quality_score)
+          ? (data.forecast_quality_score * 100).toFixed(1) + '%'
+          : '—';
+      var warn =
+        data.is_constant_prediction || data.low_variance_warning || data.degraded_input || data.fallback_mode;
+      qStrip.className = 'quality-strip' + (warn ? ' quality-warn' : '');
+      qStrip.innerHTML =
+        '<strong>Quality</strong> ' +
+        fq +
+        ' · <strong>Artifact</strong> ' +
+        am +
+        ' · ' +
+        sm +
+        ' · <strong>Validity</strong> ' +
+        fv +
+        ' · <strong>Path score</strong> ' +
+        fqs;
+      qStrip.classList.remove('hidden');
     }
 
     var explBlock = document.getElementById('pred-explanation-block');

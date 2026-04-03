@@ -14,8 +14,9 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from features.feature_builder import get_feature_columns, TARGET_PRICE_COLUMNS
+from features.feature_builder import TARGET_LOG_RETURN_1D, get_feature_columns
 from models.model_registry import get_model, list_models
+from prediction.inference_utils import load_scaler_bundle_from_disk
 from prediction.ensemble_weights import compute_weights_from_metrics, persist_ensemble_weights
 from utils.config import settings
 from utils.constants import get_supported_coins_list
@@ -24,7 +25,6 @@ from utils.logging_setup import get_logger, configure_root_logger
 logger = get_logger(__name__)
 
 CLOSE_COL = "close"
-HORIZON_DAYS = 14  # evaluate on day-14 (index 13)
 
 
 def _mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -51,38 +51,37 @@ def _mape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-10) -> float:
     return float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])))
 
 
-def _directional_accuracy(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    close: np.ndarray,
-) -> float:
-    """
-    Fraction of correct direction predictions.
-    Predicted direction: 1 if pred > close, else 0.
-    Actual direction: 1 if y_true > close, else 0.
-    """
+def _directional_accuracy_log_return(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """Fraction of steps where sign of predicted log return matches realized log return."""
     if len(y_true) == 0:
         return 0.0
-    pred_dir = (y_pred > close).astype(np.int64)
-    true_dir = (y_true > close).astype(np.int64)
-    return float(np.mean(pred_dir == true_dir))
+    s_true = np.sign(y_true)
+    s_pred = np.sign(y_pred)
+    mask = s_true != 0
+    if not np.any(mask):
+        return 0.5
+    return float(np.mean(s_true[mask] == s_pred[mask]))
 
 
 def _get_X_y_close(feature_df: pd.DataFrame) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """Extract X, y (n, 14) multi-output, and close from feature DataFrame."""
+    """Extract X, y (n,) next-day log return, and close from feature DataFrame."""
     feat_cols = get_feature_columns(include_targets=False)
     avail = [c for c in feat_cols if c in feature_df.columns]
-    target_cols = [c for c in TARGET_PRICE_COLUMNS if c in feature_df.columns]
-    if not avail or len(target_cols) != HORIZON_DAYS:
+    if not avail or TARGET_LOG_RETURN_1D not in feature_df.columns:
         return None, None, None
     X = feature_df[avail].astype(np.float64).dropna(axis=0, how="any")
     if X.empty:
         return None, None, None
-    valid_idx = X.index.intersection(feature_df[target_cols].dropna(how="any").index)
+    y_series = feature_df[TARGET_LOG_RETURN_1D].astype(np.float64)
+    valid_idx = X.index.intersection(y_series.dropna(how="any").index)
     if len(valid_idx) == 0:
         return None, None, None
-    y = feature_df.loc[valid_idx, target_cols].astype(np.float64).values  # (n, 14)
-    close = feature_df.loc[valid_idx, CLOSE_COL].astype(np.float64).values if CLOSE_COL in feature_df.columns else None
+    y = y_series.loc[valid_idx].values
+    close = (
+        feature_df.loc[valid_idx, CLOSE_COL].astype(np.float64).values
+        if CLOSE_COL in feature_df.columns
+        else None
+    )
     return X.loc[valid_idx].values, y, close
 
 
@@ -113,12 +112,31 @@ def evaluate_models(
         return {}
 
     X_test = X[split:]
-    y_test_full = y[split:]  # (n_test, 14)
-    y_test = y_test_full[:, HORIZON_DAYS - 1]  # day-14 for metrics
-    close_test = close[split:]
+    y_test = y[split:]
+    close_test = close[split:] if close is not None else None
 
     models_dir = Path(models_dir) if models_dir else settings.training.models_dir
-    coin_dir = models_dir / coin.replace(" ", "_")
+    slug = coin.replace(" ", "_")
+    coin_dir = models_dir / slug
+    bundle = load_scaler_bundle_from_disk(coin_dir, slug)
+    scaler = bundle.get("scaler")
+    if scaler is not None:
+        try:
+            X_test_s = scaler.transform(X_test)
+        except Exception as e:
+            logger.warning(
+                "Scaler transform failed for %s (%s); evaluating on raw features (legacy).",
+                coin,
+                e,
+            )
+            X_test_s = X_test
+    else:
+        logger.warning(
+            "No scaler artifact for %s; evaluating on raw features (legacy compatibility).",
+            coin,
+        )
+        X_test_s = X_test
+
     model_names = model_names or list_models()
     results: dict[str, dict[str, float]] = {}
 
@@ -129,8 +147,7 @@ def evaluate_models(
         try:
             model = get_model(name)
             model.load(path)
-            pred_full = model.predict(X_test)  # (n_test, 14) or (n_test,)
-            y_pred = pred_full[:, HORIZON_DAYS - 1] if pred_full.ndim > 1 else np.ravel(pred_full)
+            y_pred = np.ravel(model.predict(X_test_s))
         except Exception as e:
             logger.exception("Failed to evaluate %s for %s: %s", name, coin, e)
             continue
@@ -140,7 +157,7 @@ def evaluate_models(
             "rmse": _rmse(y_test, y_pred),
             "r2": _r2(y_test, y_pred),
             "mape": _mape(y_test, y_pred),
-            "directional_accuracy": _directional_accuracy(y_test, y_pred, close_test),
+            "directional_accuracy": _directional_accuracy_log_return(y_test, y_pred),
         }
     return results
 

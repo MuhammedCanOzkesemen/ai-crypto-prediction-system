@@ -22,6 +22,7 @@ COIN_DISPLAY_TO_ID: dict[str, str] = {
     "Avalanche": "avalanche-2",
     "Chainlink": "chainlink",
     "PEPE": "pepe",
+    "SHIB": "shiba-inu",
 }
 
 # Canonical list of supported coin display names (for API and pipelines)
@@ -39,6 +40,7 @@ COIN_DISPLAY_TO_BINANCE: dict[str, str] = {
     "Avalanche": "AVAXUSDT",
     "Chainlink": "LINKUSDT",
     "PEPE": "PEPEUSDT",
+    "SHIB": "SHIBUSDT",
 }
 
 
@@ -73,6 +75,12 @@ TARGET_HORIZON_DAYS = 14
 
 # Lag periods for lag features
 LAG_PERIODS = (1, 2, 3, 5, 7)
+
+# ADX / ROC / volatility regime (log-return EWMA scale)
+ADX_PERIOD = 14
+ROC_PERIODS = (5, 10)
+VOL_REGIME_LOGBOUND_LOW = 0.012
+VOL_REGIME_LOGBOUND_HIGH = 0.030
 
 # Data fetching: delay between coins to stay under CoinGecko free tier (~30/min)
 COIN_FETCH_INTERVAL_SEC = 4
