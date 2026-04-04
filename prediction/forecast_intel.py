@@ -284,6 +284,14 @@ def finalize_forecast_confidence(
     return float(max(0.0, min(1.0, c)))
 
 
+def finalize_hybrid_forecast_confidence(confidence: float, *, vol_regime: str) -> float:
+    """Light tail trim for hybrid path (avoids stacking path/classifier penalties)."""
+    c = float(max(0.0, min(1.0, confidence)))
+    if str(vol_regime).upper() == "HIGH":
+        c *= 0.94
+    return float(max(0.0, min(1.0, c)))
+
+
 def blend_signal_strength_with_twitter(
     signal_strength: float,
     twitter_sentiment: float | None,

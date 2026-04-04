@@ -11,6 +11,7 @@
   const fetchBtn = document.getElementById('fetch-btn');
   const loadingEl = document.getElementById('loading');
   const predictionEl = document.getElementById('prediction');
+  const scannerSection = document.getElementById('scanner-section');
   const chartSection = document.getElementById('chart-section');
   const forecastTableSection = document.getElementById('forecast-table-section');
   const evaluationSection = document.getElementById('evaluation-section');
@@ -28,6 +29,98 @@
     forecastTableSection.classList.add('hidden');
     evaluationSection.classList.add('hidden');
     errorEl.classList.add('hidden');
+  }
+
+  function decisionPriority(decision) {
+    var d = String(decision || 'NO_TRADE').toUpperCase();
+    if (d === 'STRONG_BUY') return 0;
+    if (d === 'WEAK_BUY') return 1;
+    return 2;
+  }
+
+  function directionText(probs) {
+    if (!probs || typeof probs !== 'object') return '—';
+    var up = typeof probs.up === 'number' ? probs.up : 0;
+    var down = typeof probs.down === 'number' ? probs.down : 0;
+    var neutral = typeof probs.neutral === 'number' ? probs.neutral : 0;
+    if (up >= down && up >= neutral) return 'UP';
+    if (down >= up && down >= neutral) return 'DOWN';
+    return 'NEUTRAL';
+  }
+
+  function renderScanner(rows) {
+    var tbody = document.getElementById('scanner-tbody');
+    var updatedEl = document.getElementById('scanner-updated');
+    if (!tbody || !scannerSection) return;
+    tbody.innerHTML = '';
+    if (!rows || !rows.length) {
+      scannerSection.classList.add('hidden');
+      return;
+    }
+
+    var maxConf = -1;
+    var maxMove = -1;
+    rows.forEach(function (row) {
+      var conf = typeof row.confidence_score === 'number' ? row.confidence_score : -1;
+      var move = typeof row.expected_move_pct === 'number' ? row.expected_move_pct : -1;
+      if (conf > maxConf) maxConf = conf;
+      if (move > maxMove) maxMove = move;
+    });
+
+    rows
+      .slice()
+      .sort(function (a, b) {
+        var p = decisionPriority(a.trade_decision) - decisionPriority(b.trade_decision);
+        if (p !== 0) return p;
+        return (b.confidence_score || 0) - (a.confidence_score || 0);
+      })
+      .forEach(function (row) {
+        var tr = document.createElement('tr');
+        var decision = String(row.trade_decision || 'NO_TRADE').toUpperCase();
+        tr.className =
+          decision === 'STRONG_BUY' ? 'scanner-row-strong' :
+          decision === 'WEAK_BUY' ? 'scanner-row-weak' :
+          'scanner-row-none';
+
+        var confCellClass = 'num';
+        var moveCellClass = 'num';
+        var confTag = '';
+        var moveTag = '';
+        if (maxConf >= 0 && Math.abs((row.confidence_score || 0) - maxConf) < 1e-9) {
+          confCellClass += ' scanner-highlight-confidence';
+          confTag = '<span class="scanner-tag">Top confidence</span>';
+        }
+        if (maxMove >= 0 && Math.abs((row.expected_move_pct || 0) - maxMove) < 1e-9) {
+          moveCellClass += ' scanner-highlight-move';
+          moveTag = '<span class="scanner-tag">Top move</span>';
+        }
+
+        tr.innerHTML =
+          '<td>' + (row.coin || '—') + '</td>' +
+          '<td><span class="scanner-decision ' +
+            (decision === 'STRONG_BUY' ? 'strong' : decision === 'WEAK_BUY' ? 'weak' : 'none') +
+            '">' + decision.replace(/_/g, ' ') + '</span></td>' +
+          '<td class="' + confCellClass + '">' + formatPercent((row.confidence_score || 0) * 100) + confTag + '</td>' +
+          '<td>' + directionText(row.directional_probabilities) + '</td>' +
+          '<td class="num">' + formatPercent((row.combined_agreement_score || 0) * 100) + '</td>' +
+          '<td class="' + moveCellClass + '">' + formatPercent((row.expected_move_pct || 0) * 100) + moveTag + '</td>';
+        tbody.appendChild(tr);
+      });
+
+    if (updatedEl) updatedEl.textContent = 'Updated ' + formatDate(new Date().toISOString());
+    scannerSection.classList.remove('hidden');
+  }
+
+  async function loadScanner() {
+    try {
+      var res = await fetch(API_BASE + '/api/predictions/all');
+      if (!res.ok) throw new Error('Failed to load market scanner');
+      var rows = await res.json();
+      renderScanner(rows || []);
+    } catch (err) {
+      console.warn('Market scanner unavailable:', err);
+      if (scannerSection) scannerSection.classList.add('hidden');
+    }
   }
 
   function showError(msg) {
@@ -137,6 +230,7 @@
         opt.textContent = c;
         coinSelect.appendChild(opt);
       });
+      loadScanner();
     } catch (err) {
       showError('Could not load coin list: ' + (err.message || err));
     }
@@ -627,6 +721,7 @@
         evaluationSection.classList.remove('hidden');
       }
 
+      loadScanner();
       scheduleRefresh();
     } catch (err) {
       showError('Error loading data: ' + (err.message || err));

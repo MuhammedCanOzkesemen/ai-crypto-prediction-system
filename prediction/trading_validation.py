@@ -155,3 +155,31 @@ def compose_risk_adjusted_confidence(
     if volatility_regime_high or volatility_shock:
         c = min(c, 0.6)
     return float(round(c, 4))
+
+
+def compose_light_risk_adjusted_confidence(
+    base_confidence: float,
+    *,
+    volatility_regime_high: bool,
+    volatility_shock: bool,
+    chaotic_disagreement: bool,
+    market_regime: str | None = None,
+) -> float:
+    """
+    Mild adjustment for hybrid confidence (directional + combined agreement already in base).
+    Avoids multiplicative stacking on stability/consensus.
+    """
+    c = float(max(0.0, min(1.0, base_confidence)))
+    mr = str(market_regime or "").strip().upper()
+    if mr == "VOLATILE":
+        c *= 0.94
+    elif mr == "TRENDING":
+        c = min(1.0, c * 1.02)
+    elif mr == "RANGING":
+        c *= 0.98
+    c = float(max(0.0, min(1.0, c)))
+    if chaotic_disagreement:
+        c = min(c, 0.58)
+    if volatility_regime_high or volatility_shock:
+        c = min(c, 0.72)
+    return float(round(c, 4))

@@ -473,6 +473,106 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.scanner-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.85rem;
+}
+
+.scanner-updated {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.scanner-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.86rem;
+}
+
+.scanner-table th,
+.scanner-table td {
+  padding: 0.55rem 0.75rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+}
+
+.scanner-table th {
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.74rem;
+}
+
+.scanner-table tbody tr:hover {
+  background: rgba(88, 166, 255, 0.05);
+}
+
+.scanner-table td.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.scanner-row-strong {
+  background: rgba(63, 185, 80, 0.07);
+}
+
+.scanner-row-weak {
+  background: rgba(227, 179, 65, 0.08);
+}
+
+.scanner-row-none {
+  background: rgba(139, 148, 158, 0.04);
+}
+
+.scanner-decision {
+  display: inline-block;
+  padding: 0.28rem 0.55rem;
+  border-radius: var(--radius);
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.scanner-decision.strong {
+  background: rgba(63, 185, 80, 0.2);
+  color: var(--success);
+  border: 1px solid rgba(63, 185, 80, 0.45);
+}
+
+.scanner-decision.weak {
+  background: rgba(210, 153, 34, 0.18);
+  color: #e3b341;
+  border: 1px solid rgba(210, 153, 34, 0.4);
+}
+
+.scanner-decision.none {
+  background: var(--bg-input);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+}
+
+.scanner-highlight-confidence {
+  box-shadow: inset 0 0 0 1px rgba(88, 166, 255, 0.65);
+}
+
+.scanner-highlight-move {
+  box-shadow: inset 0 0 0 1px rgba(227, 179, 65, 0.65);
+}
+
+.scanner-tag {
+  display: inline-block;
+  margin-left: 0.4rem;
+  padding: 0.08rem 0.35rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  color: var(--text);
+  background: rgba(88, 166, 255, 0.14);
+  border: 1px solid rgba(88, 166, 255, 0.32);
+}
+
 /* Forecast period & data freshness */
 .pred-item-freshness {
   grid-column: 1 / -1;

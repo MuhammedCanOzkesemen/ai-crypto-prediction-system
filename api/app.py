@@ -74,6 +74,18 @@ class CoinPredictionResponse(BaseModel):
         default_factory=dict,
         description="Optional down/neutral/up from directional head",
     )
+    directional_confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="max(up, down, neutral) from merged directional classifier probabilities",
+    )
+    combined_agreement_score: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Blend of regression path agreement and LR vs XGB directional agreement",
+    )
     volatility_regime: str = Field("UNKNOWN", description="LOW | MEDIUM | HIGH from log-vol regime")
     realism_guardrail_triggered: bool = False
     forecast_audit: dict[str, Any] = Field(default_factory=dict)
@@ -138,6 +150,20 @@ class CoinPredictionResponse(BaseModel):
         le=1.0,
         description="Classifier confidence in the current regime label",
     )
+
+
+class MarketScannerRow(BaseModel):
+    """Compact row for the all-coins market scanner."""
+
+    coin: str
+    directional_confidence: float = Field(0.0, ge=0.0, le=1.0)
+    combined_agreement_score: float = Field(0.0, ge=0.0, le=1.0)
+    confidence_score: float = Field(0.0, ge=0.0, le=1.0)
+    trade_decision: str = Field("NO_TRADE")
+    expected_move_pct: float = Field(0.0, ge=0.0)
+    volatility_regime: str = Field("UNKNOWN")
+    signal_strength_score: float = Field(0.0, ge=0.0, le=1.0)
+    directional_probabilities: dict[str, float] = Field(default_factory=dict)
 
 
 class HealthResponse(BaseModel):
@@ -240,6 +266,17 @@ def _data_freshness(latest_market_ts: str | None) -> tuple[str, str | None]:
         return "stale", "Could not determine data freshness."
 
 
+def _scanner_sort_key(row: MarketScannerRow) -> tuple[int, float, float, float, str]:
+    pri = {"STRONG_BUY": 0, "WEAK_BUY": 1, "NO_TRADE": 2}
+    return (
+        pri.get(str(row.trade_decision).upper(), 3),
+        -float(row.confidence_score),
+        -float(row.expected_move_pct),
+        -float(row.combined_agreement_score),
+        str(row.coin),
+    )
+
+
 class ForecastPathResponse(BaseModel):
     """Full 14-day forecast path with summary and intelligence layer."""
     coin: str
@@ -329,6 +366,18 @@ class ForecastPathResponse(BaseModel):
     )
     signal_strength_score: float = Field(0.0, ge=0.0, le=1.0)
     directional_probabilities: dict[str, float] = Field(default_factory=dict)
+    directional_confidence: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="max(up, down, neutral) from merged directional probabilities",
+    )
+    combined_agreement_score: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description="Regression agreement blended with directional-model agreement",
+    )
     volatility_regime: str = Field("UNKNOWN", description="LOW | MEDIUM | HIGH | UNKNOWN")
     trade_signal: str = Field("NO_TRADE", description="BUY | SELL | NO_TRADE (legacy decision filter)")
     trade_decision: str = Field(
@@ -575,6 +624,8 @@ def create_app() -> FastAPI:
             high_conviction=bool(path_result.get("high_conviction", False)),
             signal_strength_score=float(path_result.get("signal_strength_score") or 0.0),
             directional_probabilities=dict(path_result.get("directional_probabilities") or {}),
+            directional_confidence=float(path_result.get("directional_confidence") or 0.0),
+            combined_agreement_score=float(path_result.get("combined_agreement_score") or 0.0),
             volatility_regime=str(path_result.get("volatility_regime") or "UNKNOWN"),
             trade_signal=str(path_result.get("trade_signal") or "NO_TRADE"),
             trade_decision=str(path_result.get("trade_decision", "NO_TRADE")),
@@ -697,6 +748,31 @@ def create_app() -> FastAPI:
             },
         }
 
+    @api_router.get("/backtest/{coin}")
+    def backtest_saved_summary(
+        coin: str = PathParam(..., description="Coin display name"),
+    ) -> dict[str, Any]:
+        """
+        Return the latest saved trade backtest summary JSON from ``artifacts/backtests/``.
+
+        Does not run a backtest on request; run ``python scripts/run_backtest.py`` offline first.
+        """
+        supported = get_supported_coins_list()
+        match = next((c for c in supported if c.lower() == coin.strip().lower()), None)
+        if match is None:
+            raise HTTPException(status_code=404, detail=f"Unsupported coin: {coin}")
+        path = settings.data.artifact_dir / "backtests" / f"{match.replace(' ', '_')}_summary.json"
+        if not path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="No backtest summary on disk. Run: python scripts/run_backtest.py --coin " + match,
+            )
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.exception("Failed to read backtest summary for %s: %s", match, e)
+            raise HTTPException(status_code=500, detail="Backtest summary file is unreadable") from e
+
     app.include_router(api_router, prefix="/api")
 
     @app.get("/predictions/{coin}", response_model=CoinPredictionResponse)
@@ -748,6 +824,8 @@ def create_app() -> FastAPI:
             high_conviction=bool(diag.get("high_conviction", False)),
             signal_strength_score=float(diag.get("signal_strength_score") or 0.0),
             directional_probabilities=dict(diag.get("directional_probabilities") or {}),
+            directional_confidence=float(diag.get("directional_confidence") or 0.0),
+            combined_agreement_score=float(diag.get("combined_agreement_score") or 0.0),
             volatility_regime=str(diag.get("volatility_regime") or "UNKNOWN"),
             realism_guardrail_triggered=bool(diag.get("realism_guardrail_cumulative", False)),
             forecast_audit=forecast_audit_api_subset(diag.get("forecast_audit") or {}),
@@ -758,6 +836,7 @@ def create_app() -> FastAPI:
                 "sanity_check": diag.get("sanity_check") or {},
                 "step0_raw_logret_by_model": diag.get("step0_raw_logret_by_model") or {},
                 "model_horizon_variance_raw": diag.get("model_horizon_variance_raw") or {},
+                "agreement_diagnostics": diag.get("agreement_diagnostics") or {},
                 "max_missing_feature_fill_ratio": float(diag.get("max_missing_feature_fill_ratio", 0.0)),
                 "twitter_sentiment_used": bool(diag.get("twitter_sentiment_used", False)),
                 "sentiment_alignment": float(diag.get("sentiment_alignment", 0.0)),
@@ -795,6 +874,36 @@ def create_app() -> FastAPI:
             market_regime=str(diag.get("market_regime", "RANGING")),
             market_regime_confidence=float(diag.get("market_regime_confidence", 0.0)),
         )
+
+    @app.get("/api/predictions/all", response_model=list[MarketScannerRow])
+    def predictions_all() -> list[MarketScannerRow]:
+        """Compact scanner rows for all supported coins, sorted by trade priority."""
+        features_dir = settings.training.features_dir
+        rows: list[MarketScannerRow] = []
+        for coin in get_supported_coins_list():
+            try:
+                result = predictor.predict_from_latest_features(coin, features_dir=features_dir)
+            except Exception as e:
+                logger.warning("Scanner prediction failed for %s: %s", coin, e)
+                continue
+            if not result:
+                continue
+            diag = result.get("_forecast_diagnostics") or {}
+            rows.append(
+                MarketScannerRow(
+                    coin=str(result.get("coin") or coin),
+                    directional_confidence=float(diag.get("directional_confidence") or 0.0),
+                    combined_agreement_score=float(diag.get("combined_agreement_score") or 0.0),
+                    confidence_score=float(diag.get("confidence_score") or 0.0),
+                    trade_decision=str(diag.get("trade_decision") or "NO_TRADE"),
+                    expected_move_pct=float(diag.get("expected_move_pct") or 0.0),
+                    volatility_regime=str(diag.get("volatility_regime") or "UNKNOWN"),
+                    signal_strength_score=float(diag.get("signal_strength_score") or 0.0),
+                    directional_probabilities=dict(diag.get("directional_probabilities") or {}),
+                )
+            )
+        rows.sort(key=_scanner_sort_key)
+        return rows
 
     # Dashboard (defined before mount so it takes precedence)
     index_path = DASHBOARD_DIR / "index.html"

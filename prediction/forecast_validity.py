@@ -53,19 +53,13 @@ def compute_forecast_validity_and_quality_score(diag: dict[str, Any]) -> tuple[s
 
 
 def confidence_composition_doc() -> str:
-    """Documented composition for product/engineering (mirrors forecast_intel weights + penalties)."""
+    """Documented composition for product/engineering (hybrid directional + path stack)."""
     return (
-        "confidence_score combines: (1) cross-model log-return variance — very low variance is penalized "
-        "(clip-collapse / shared failure); (2) historical test MAE/RMSE; (3) volatility regime; "
-        "(4) path agreement scores. Multiplicative penalties for: non-production artifact_mode, fallback_mode, "
-        "missing exact feature match, cumulative realism guardrail, clip-saturation fraction, sanity outlier vs "
-        "historical tail, constant path (cap 0.12), low-variance path, degraded_input / imputation. "
-        "artifact_mode legacy/degraded applies extra multipliers in compute_financial_confidence(). "
-        "Signal-strength score, directional-classifier agreement/uncertainty, and vol regime adjust confidence; "
-        "finalize_forecast_confidence() caps when agreement is low and the classifier is uncertain; "
-        "caps also in apply_confidence_penalty_caps(). "
-        "decision_layer.apply_trade_aware_confidence() then scales confidence to trade reliability (edge, R:R, vol). "
-        "Cross-model log-return spread uses chaotic (mixed-sign) vs directional (same-sign) disagreement weighting. "
-        "trend_consistency_score from features can lift financial confidence when stable. "
-        "See compute_financial_confidence() and predictor predict_from_latest_features() for parameters."
+        "Primary confidence_score is hybrid: 0.4×directional_confidence (max of merged UP/DOWN/NEUTRAL probs) + "
+        "0.3×combined_agreement_score (regression path agreement blended with LR vs XGB directional agreement) + "
+        "0.3×signal_strength_score. Light caps apply (HIGH vol, shock, chaotic disagreement, regime) via "
+        "compose_light_risk_adjusted_confidence — Twitter/regime do not multiplicatively stack on top. "
+        "legacy_financial_confidence_raw is retained as a diagnostic (old regression-heavy path). "
+        "decision_layer may further adjust for trade UI; strict trade engine uses directional_confidence, "
+        "combined_agreement_score, and expected_move_pct gates. See prediction/predictor.py and trade_filter.py."
     )

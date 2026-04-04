@@ -61,7 +61,12 @@ from models.model_registry import get_model, list_models
 from prediction.inference_utils import save_scaler_bundle
 from evaluation.model_evaluator import run_evaluation
 from evaluation.backtest import BacktestConfig, run_backtest_all
-from prediction.directional_classifier import build_directional_labels
+from prediction.directional_classifier import (
+    BUNDLE_VERSION,
+    DIRECTIONAL_LABEL_HORIZON_DAYS,
+    DIRECTIONAL_RETURN_THRESHOLD_PCT,
+    build_directional_labels_forward_close,
+)
 
 logger = get_logger(__name__)
 
@@ -175,6 +180,164 @@ def _get_X_y(feature_df):
     return X.values, y.values, avail  # avail = column order for scaler
 
 
+def _get_X_y_with_close(feature_df):
+    """
+    Extract X, y, feature order, and aligned current close prices.
+
+    Alignment matches the existing regression target construction:
+    - features at row t
+    - target_log_return_1d for t -> t+1
+    - close at row t for forward-return directional labels
+
+    Rows with missing features, target, or close are dropped so downstream
+    regression/classification training stays leakage-safe and index-aligned.
+    """
+    import numpy as np
+
+    feat_cols = get_feature_columns(include_targets=False)
+    avail = [c for c in feat_cols if c in feature_df.columns]
+    if not avail or TARGET_LOG_RETURN_1D not in feature_df.columns or "close" not in feature_df.columns:
+        return None, None, None, None
+
+    X = feature_df[avail].astype(np.float64).dropna(axis=0, how="any")
+    if X.empty:
+        return None, None, None, None
+
+    y_series = feature_df[TARGET_LOG_RETURN_1D].astype(np.float64)
+    close_series = feature_df["close"].astype(np.float64)
+
+    valid_idx = X.index
+    valid_idx = valid_idx.intersection(y_series.dropna(how="any").index)
+    valid_idx = valid_idx.intersection(close_series.dropna(how="any").index)
+    if len(valid_idx) == 0:
+        return None, None, None, None
+
+    X = X.loc[valid_idx]
+    y = y_series.loc[valid_idx]
+    close = close_series.loc[valid_idx]
+    return X.values, y.values, avail, close.values
+
+
+def _train_and_save_directional_classifier(
+    *,
+    coin: str,
+    coin_dir: Path,
+    X_train_s,
+    y_train,
+    close_train,
+) -> None:
+    """
+    Train and persist the directional classifier bundle.
+
+    This step is mandatory for the hybrid forecasting stack. It raises on any
+    invalid input, training failure, or missing artifact after save so the
+    pipeline cannot silently finish without directional intelligence artifacts.
+    """
+    import numpy as np
+    from sklearn.linear_model import LogisticRegression
+    from xgboost import XGBClassifier
+
+    logger.info("Training directional classifier for %s...", coin)
+
+    if close_train is None:
+        raise RuntimeError(f"{coin}: missing close alignment for directional classifier training")
+
+    X_train_s = np.asarray(X_train_s, dtype=np.float64)
+    y_train = np.asarray(y_train, dtype=np.float64).ravel()
+    close_train = np.asarray(close_train, dtype=np.float64).ravel()
+
+    if X_train_s.ndim != 2 or X_train_s.shape[0] == 0:
+        raise RuntimeError(f"{coin}: X_train for directional classifier is empty")
+    if y_train.ndim != 1 or y_train.shape[0] == 0:
+        raise RuntimeError(f"{coin}: y_train for directional classifier is empty")
+    if close_train.shape[0] != X_train_s.shape[0]:
+        raise RuntimeError(
+            f"{coin}: close/X alignment mismatch for directional classifier "
+            f"({close_train.shape[0]} vs {X_train_s.shape[0]})"
+        )
+
+    y_cls_full, valid_mask = build_directional_labels_forward_close(
+        close_train,
+        horizon=DIRECTIONAL_LABEL_HORIZON_DAYS,
+        threshold_pct=DIRECTIONAL_RETURN_THRESHOLD_PCT,
+    )
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    if valid_mask.shape[0] != X_train_s.shape[0]:
+        raise RuntimeError(
+            f"{coin}: directional label mask/X mismatch ({valid_mask.shape[0]} vs {X_train_s.shape[0]})"
+        )
+    if not np.any(valid_mask):
+        raise RuntimeError(f"{coin}: directional classifier produced zero valid labels")
+
+    X_dir = X_train_s[valid_mask]
+    y_cls = np.asarray(y_cls_full[valid_mask], dtype=np.int64)
+
+    if X_dir.shape[0] == 0:
+        raise RuntimeError(f"{coin}: directional classifier has zero usable training rows")
+    if len(np.unique(y_cls)) < 2:
+        raise RuntimeError(
+            f"{coin}: directional classifier requires at least 2 classes, got {sorted(np.unique(y_cls).tolist())}"
+        )
+
+    label_counts = {
+        "down": int(np.sum(y_cls == 0)),
+        "neutral": int(np.sum(y_cls == 1)),
+        "up": int(np.sum(y_cls == 2)),
+    }
+    logger.info(
+        "Directional labels for %s: rows=%d down=%d neutral=%d up=%d horizon=%d threshold=%.4f",
+        coin,
+        int(X_dir.shape[0]),
+        label_counts["down"],
+        label_counts["neutral"],
+        label_counts["up"],
+        DIRECTIONAL_LABEL_HORIZON_DAYS,
+        DIRECTIONAL_RETURN_THRESHOLD_PCT,
+    )
+
+    lr_clf = LogisticRegression(
+        max_iter=1200,
+        class_weight="balanced",
+        random_state=42,
+        solver="lbfgs",
+    )
+    lr_clf.fit(X_dir, y_cls)
+
+    xgb_clf = XGBClassifier(
+        n_estimators=160,
+        max_depth=5,
+        learning_rate=0.08,
+        subsample=0.85,
+        colsample_bytree=0.85,
+        random_state=42,
+        n_jobs=-1,
+        eval_metric="mlogloss",
+    )
+    xgb_clf.fit(X_dir, y_cls)
+
+    save_path = coin_dir / "directional_classifier_bundle.joblib"
+    legacy_path = coin_dir / "directional_classifier.joblib"
+    logger.info("Saving directional classifier for %s to %s...", coin, save_path)
+
+    bundle = {
+        "version": BUNDLE_VERSION,
+        "logistic_regression": lr_clf,
+        "xgboost_classifier": xgb_clf,
+        "horizon_days": DIRECTIONAL_LABEL_HORIZON_DAYS,
+        "threshold_pct": DIRECTIONAL_RETURN_THRESHOLD_PCT,
+        "classes": ("down", "neutral", "up"),
+    }
+    joblib.dump(bundle, save_path)
+    joblib.dump(lr_clf, legacy_path)
+
+    if not save_path.exists():
+        raise RuntimeError(f"{coin}: directional classifier bundle save failed at {save_path}")
+    if not legacy_path.exists():
+        raise RuntimeError(f"{coin}: legacy directional classifier save failed at {legacy_path}")
+
+    logger.info("Saved directional classifier for %s", coin)
+
+
 def run_train_models(
     coins: list[str] | None = None,
     train_ratio: float | None = None,
@@ -206,7 +369,12 @@ def run_train_models(
         except Exception as e:
             logger.exception("Failed to load %s: %s", path, e)
             continue
-        X, y, feat_order = _get_X_y(df)
+        tup = _get_X_y_with_close(df)
+        if tup[0] is None:
+            X, y, feat_order = _get_X_y(df)
+            close_all = None
+        else:
+            X, y, feat_order, close_all = tup
         if X is None or y is None or len(X) < 50:
             logger.warning("Insufficient data for %s (rows=%s); skipping.", coin, len(X) if X is not None else 0)
             continue
@@ -236,24 +404,14 @@ def run_train_models(
             logger.exception("Failed to save scaler for %s: %s", coin, e)
             continue
 
-        try:
-            import numpy as np
-            from sklearn.linear_model import LogisticRegression
-
-            y_cls = build_directional_labels(y_train)
-            if len(np.unique(y_cls)) >= 2:
-                dclf = LogisticRegression(
-                    max_iter=800,
-                    class_weight="balanced",
-                    random_state=42,
-                    solver="lbfgs",
-                    multi_class="auto",
-                )
-                dclf.fit(X_train_s, y_cls)
-                joblib.dump(dclf, coin_dir / "directional_classifier.joblib")
-                logger.info("Saved directional_classifier.joblib for %s", coin)
-        except Exception as e:
-            logger.warning("Directional classifier not trained for %s: %s", coin, e)
+        close_train = close_all[:split] if close_all is not None and len(close_all) >= split else None
+        _train_and_save_directional_classifier(
+            coin=coin,
+            coin_dir=coin_dir,
+            X_train_s=X_train_s,
+            y_train=y_train,
+            close_train=close_train,
+        )
 
         pm_cols = per_model_feature_lists(model_names, feat_order)
         per_model_idx = indices_dict_for_metadata(pm_cols, feat_order)

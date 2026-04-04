@@ -23,6 +23,15 @@ from models.model_registry import get_model, list_models
 from prediction.ensemble_weights import compute_weights_from_metrics, load_evaluation_metrics
 from prediction.decision_layer import compute_decision_bundle, format_trade_decision_explanation
 from prediction.trade_filter import evaluate_trade_opportunity
+from prediction.directional_classifier import (
+    combined_agreement_score as combine_reg_dir_agreement,
+    compute_hybrid_primary_confidence,
+    directional_confidence_from_probs,
+    directional_distribution_agreement,
+    merge_directional_probabilities,
+    proba_dict_from_sklearn_row,
+    regression_agreement_with_diagnostics,
+)
 from prediction.forecast_intel import (
     apply_confidence_penalty_caps,
     blend_signal_strength_with_twitter,
@@ -33,6 +42,7 @@ from prediction.forecast_intel import (
     compute_financial_confidence,
     compute_signal_strength_score,
     finalize_forecast_confidence,
+    finalize_hybrid_forecast_confidence,
     infer_volatility_regime_from_context,
 )
 from prediction.forecast_postprocess import market_data_freshness
@@ -53,6 +63,7 @@ from prediction.multi_day_consensus import consensus_score_from_snapshots
 from prediction.realism import OUTER_DAILY_ABS_CAP, clip_daily_log_return, daily_log_return_cap
 from prediction.signal_cooldown import cooldown_active, register_actionable_signal
 from prediction.trading_validation import (
+    compose_light_risk_adjusted_confidence,
     compose_risk_adjusted_confidence,
     compute_path_stability_score,
     compute_trend_confirmation_score,
@@ -124,6 +135,11 @@ class Predictor:
         """Structured failure from the last predict_from_latest_features (if any)."""
         return self._last_forecast_error
 
+    def _forecast_models_for_coin(self, coin: str) -> dict[str, Any]:
+        """Only the regression ensemble members used for price forecasting."""
+        loaded = self._loaded.get(coin) or {}
+        return {name: loaded[name] for name in list_models() if name in loaded}
+
     def load_models(self, coin: str) -> bool:
         coin_dir = self.models_dir / coin.replace(" ", "_")
         if not coin_dir.exists():
@@ -148,8 +164,15 @@ class Predictor:
                     )
                 except Exception as e:
                     logger.exception("Failed to load %s for %s: %s", name, coin, e)
+        bundle_dc = coin_dir / "directional_classifier_bundle.joblib"
+        if bundle_dc.exists():
+            try:
+                self._loaded[coin]["directional_classifier_bundle"] = joblib.load(bundle_dc)
+                logger.info("Loaded directional_classifier_bundle for %s", coin)
+            except Exception as e:
+                logger.warning("Failed to load directional_classifier_bundle for %s: %s", coin, e)
         dc_path = coin_dir / "directional_classifier.joblib"
-        if dc_path.exists():
+        if dc_path.exists() and "directional_classifier_bundle" not in (self._loaded.get(coin) or {}):
             try:
                 self._loaded[coin]["directional_classifier"] = joblib.load(dc_path)
                 logger.info("Loaded directional_classifier for %s", coin)
@@ -157,48 +180,95 @@ class Predictor:
                 logger.warning("Failed to load directional_classifier for %s: %s", coin, e)
         return any(name in self._loaded[coin] for name in list_models())
 
-    def _directional_classifier_proba(
+    def _directional_head_full(
         self,
         feature_df: pd.DataFrame,
         coin: str,
         bundle: dict[str, Any],
-    ) -> dict[str, float] | None:
-        """Posterior over down/neutral/up from optional logistic head (scaled features)."""
-        clf = (self._loaded.get(coin) or {}).get("directional_classifier")
+        training_meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Directional bundle: merged P(up/down/neutral), max-prob confidence, LR–XGB agreement.
+        Falls back to legacy single ``directional_classifier.joblib`` if no bundle.
+        """
+        empty = {
+            "probabilities": {},
+            "directional_confidence": 0.0,
+            "directional_model_agreement": 0.0,
+            "directional_probabilities_lr": None,
+            "directional_probabilities_xgb": None,
+        }
         cols = bundle.get("feature_columns")
+        if not cols:
+            raw_meta_cols = (training_meta or {}).get("feature_columns")
+            if isinstance(raw_meta_cols, list) and raw_meta_cols:
+                cols = [str(c) for c in raw_meta_cols]
         scaler = bundle.get("scaler")
-        if clf is None or not cols:
-            return None
+        if not cols:
+            return empty
         row = feature_df.iloc[-1]
         try:
             vals = []
             for c in cols:
                 if c not in feature_df.columns:
-                    return None
+                    return empty
                 v = row[c]
                 vals.append(float(v) if pd.notna(v) else 0.0)
             X = np.asarray(vals, dtype=np.float64).reshape(1, -1)
         except (TypeError, ValueError, KeyError):
-            return None
+            return empty
         if scaler is not None:
             try:
                 X = scaler.transform(X)
             except Exception as e:
-                logger.warning("directional_classifier scaler transform failed: %s", e)
-                return None
-        try:
-            proba = clf.predict_proba(X)[0]
-            classes = list(getattr(clf, "classes_", range(len(proba))))
-            labels = ("down", "neutral", "up")
-            out: dict[str, float] = {}
-            for i, cls in enumerate(classes):
-                idx = int(cls)
-                if 0 <= idx < 3:
-                    out[labels[idx]] = float(proba[i])
-            return out if out else None
-        except Exception as e:
-            logger.warning("directional_classifier predict_proba failed: %s", e)
-            return None
+                logger.warning("directional head scaler transform failed: %s", e)
+                return empty
+
+        loaded = self._loaded.get(coin) or {}
+        b = loaded.get("directional_classifier_bundle")
+        legacy = loaded.get("directional_classifier")
+        p_lr: dict[str, float] | None = None
+        p_xgb: dict[str, float] | None = None
+
+        if isinstance(b, dict) and b.get("logistic_regression") is not None:
+            lr = b.get("logistic_regression")
+            xgb = b.get("xgboost_classifier")
+            try:
+                pr = lr.predict_proba(X)[0]
+                p_lr = proba_dict_from_sklearn_row(pr, lr.classes_)
+            except Exception as e:
+                logger.warning("directional logistic predict_proba failed: %s", e)
+            if xgb is not None:
+                try:
+                    pr = xgb.predict_proba(X)[0]
+                    p_xgb = proba_dict_from_sklearn_row(pr, xgb.classes_)
+                except Exception as e:
+                    logger.warning("directional xgboost predict_proba failed: %s", e)
+            merged = merge_directional_probabilities(p_lr, p_xgb)
+            if p_lr and p_xgb:
+                dag = directional_distribution_agreement(p_lr, p_xgb)
+            else:
+                dag = 1.0
+        elif legacy is not None:
+            try:
+                proba = legacy.predict_proba(X)[0]
+                classes = list(getattr(legacy, "classes_", range(len(proba))))
+                merged = proba_dict_from_sklearn_row(proba, classes)
+                dag = 1.0
+            except Exception as e:
+                logger.warning("directional_classifier predict_proba failed: %s", e)
+                return empty
+        else:
+            return empty
+
+        dc = directional_confidence_from_probs(merged)
+        return {
+            "probabilities": merged,
+            "directional_confidence": float(dc),
+            "directional_model_agreement": float(dag),
+            "directional_probabilities_lr": p_lr,
+            "directional_probabilities_xgb": p_xgb,
+        }
 
     def _load_inference_bundle(self, coin: str) -> dict[str, Any]:
         """
@@ -233,7 +303,7 @@ class Predictor:
         """
         if coin not in self._loaded:
             self.load_models(coin)
-        models = self._loaded.get(coin, {})
+        models = self._forecast_models_for_coin(coin)
         bundle = self._load_inference_bundle(coin)
         if not models:
             return {
@@ -448,57 +518,32 @@ class Predictor:
                     continue
         return out
 
-    def predict_from_latest_features(
+    def _run_full_forecast_pipeline(
         self,
         coin: str,
-        features_dir: Path | None = None,
+        df: pd.DataFrame,
+        *,
+        include_twitter: bool = True,
+        use_regime_gating: bool = True,
+        cooldown_active_override: bool | None = None,
+        register_signal_cooldown: bool = True,
+        strict_trade_filter: bool = True,
+        decision_gate_multiplier: float = 1.0,
     ) -> dict[str, Any] | None:
         """
-        Recursive 14-step forecast from latest feature parquet OHLCV history.
+        Core forecast + decision pipeline on an OHLCV frame (sorted, past-only for backtests).
+
+        Leakage guard: callers must pass ``df`` truncated to information available at the
+        decision bar (no future rows). Twitter block uses ``coin=None`` when
+        ``include_twitter`` is False so sentiment features stay neutral without future tweets.
         """
-        self._last_forecast_error = None
-        features_dir = Path(features_dir) if features_dir else settings.training.features_dir
-        refresh_data_if_needed(coin, features_dir=features_dir)
-        path = features_dir / f"{coin.replace(' ', '_')}_features.parquet"
-        if not path.exists():
-            logger.warning("Feature file not found: %s", path)
-            self._last_forecast_error = {
-                "code": "no_feature_file",
-                "message": f"Feature parquet not found: {path.name}",
-                "hint": "Run training pipeline or POST /api/refresh/{coin} to build features.",
-            }
-            return None
-        try:
-            df = pd.read_parquet(path)
-        except Exception as e:
-            logger.exception("Failed to load features for %s: %s", coin, e)
-            self._last_forecast_error = {
-                "code": "feature_load_failed",
-                "message": str(e),
-                "hint": "Check that the parquet file is readable and not corrupted.",
-            }
-            return None
-        if df.empty or len(df) < 80:
-            logger.warning("Insufficient history for %s", coin)
-            self._last_forecast_error = {
-                "code": "insufficient_history",
-                "message": f"Need at least 80 rows of history; got {len(df)}.",
-                "hint": "Fetch more historical data and rebuild features.",
-            }
-            return None
         req = ["date", "open", "high", "low", "close", "volume"]
-        if not all(c in df.columns for c in req):
-            logger.warning("Feature file missing OHLCV columns for %s", coin)
-            self._last_forecast_error = {
-                "code": "missing_ohlcv_columns",
-                "message": f"Parquet must include columns: {req}",
-                "hint": "Regenerate features from OHLCV source data.",
-            }
+        if df.empty or len(df) < 80 or not all(c in df.columns for c in req):
             return None
 
         if coin not in self._loaded:
             self.load_models(coin)
-        models = self._loaded.get(coin, {})
+        models = self._forecast_models_for_coin(coin)
         bundle = self._load_inference_bundle(coin)
         if not models:
             self._last_forecast_error = {
@@ -516,8 +561,9 @@ class Predictor:
         training_meta = load_training_metadata(coin_dir)
 
         history = df[req].copy()
+        feat_coin = coin if include_twitter else None
         full_feat = build_features(
-            history.tail(min(1000, len(history))), include_targets=False, coin=coin
+            history.tail(min(1000, len(history))), include_targets=False, coin=feat_coin
         )
         feature_sanity_ok = True
         feature_sanity_issues: list[str] = []
@@ -535,7 +581,7 @@ class Predictor:
             if len(history) - k < min_hist_rows:
                 continue
             sub = history.iloc[: len(history) - k].copy()
-            fd_k = build_features(sub.tail(min(1000, len(sub))), include_targets=False, coin=coin)
+            fd_k = build_features(sub.tail(min(1000, len(sub))), include_targets=False, coin=feat_coin)
             if fd_k.empty:
                 continue
             st = self._ensemble_one_step_log_return(
@@ -543,11 +589,19 @@ class Predictor:
             )
             consensus_snaps.append({"direction": st["direction"], "confidence": st["confidence"]})
         consensus_score, consensus_reasons = consensus_score_from_snapshots(consensus_snaps)
-        cooldown_block, cooldown_msg = cooldown_active(coin)
+        if cooldown_active_override is not None:
+            cooldown_block = bool(cooldown_active_override)
+            cooldown_msg = "Simulated cooldown active" if cooldown_block else None
+        else:
+            cooldown_block, cooldown_msg = cooldown_active(coin)
 
         regime_info = detect_market_regime(full_feat)
-        market_regime_label = str(regime_info.get("regime", "RANGING"))
-        market_regime_conf = float(regime_info.get("market_regime_confidence", 0.5))
+        regime_detected = str(regime_info.get("regime", "RANGING"))
+        regime_conf_detected = float(regime_info.get("market_regime_confidence", 0.5))
+        regime_trade = regime_detected if use_regime_gating else "RANGING"
+        regime_conf_trade = regime_conf_detected if use_regime_gating else 0.5
+        market_regime_label = regime_detected
+        market_regime_conf = regime_conf_detected
 
         feat_live = full_feat
         live_ix = feat_live.iloc[-1].index if len(feat_live) else pd.Index([])
@@ -559,7 +613,9 @@ class Predictor:
         )
 
         inf_bundle = self._load_inference_bundle(coin)
-        dir_probs = self._directional_classifier_proba(df, coin, inf_bundle)
+        clf_src = full_feat if not full_feat.empty else df
+        dir_head = self._directional_head_full(clf_src, coin, inf_bundle, training_meta)
+        dir_probs = dir_head.get("probabilities") or {}
 
         try:
             path_raw, _, vol0, forecast_diag = recursive_log_return_forecast(
@@ -569,7 +625,7 @@ class Predictor:
                 bundle,
                 training_meta=training_meta,
                 horizon=HORIZON_DAYS,
-                coin=coin,
+                coin=feat_coin,
             )
         except Exception as e:
             logger.exception("Recursive forecast failed for %s: %s", coin, e)
@@ -589,17 +645,20 @@ class Predictor:
             }
             return None
 
-        current_close = float(df["close"].iloc[-1])
-        feature_context = self._feature_context_from_row(df)
+        current_close = float(history["close"].iloc[-1])
+        ctx_src = full_feat if not full_feat.empty else df
+        feature_context = self._feature_context_from_row(ctx_src)
         feature_context.setdefault("ewma_vol_logret_14", vol0)
 
         last = path_raw[-1]
         agreements = [float(p["agreement_score"]) for p in path_raw]
         mean_agree = float(np.mean(agreements)) if agreements else 0.0
-        lr_matrix = [
-            [float(p["model_log_returns"][m]) for m in sorted(p["model_log_returns"])]
-            for p in path_raw
-        ]
+        model_order = sorted(path_raw[0]["model_log_returns"]) if path_raw else []
+        lr_matrix = [[float(p["model_log_returns"][m]) for m in model_order] for p in path_raw]
+        regression_agree, agreement_diag = regression_agreement_with_diagnostics(
+            lr_matrix,
+            model_order,
+        )
         chaotic, chaos_frac = lr_matrix_chaotic_disagreement(lr_matrix)
         stability_score = compute_path_stability_score(path_raw)
         forecast_bullish = float(last["predicted_price"]) > current_close
@@ -666,6 +725,21 @@ class Predictor:
         merged["forecast_quality"] = _fq.get(str(merged["artifact_mode"]), "degraded")
         merged["fallback_mode"] = merged["artifact_mode"] != "production"
         merged["directional_probabilities"] = dir_probs or {}
+        dir_conf_f = float(dir_head.get("directional_confidence") or 0.0)
+        dir_model_agree = float(dir_head.get("directional_model_agreement") or 0.0)
+        merged["directional_confidence"] = round(dir_conf_f, 4)
+        merged["directional_probabilities_lr"] = dir_head.get("directional_probabilities_lr")
+        merged["directional_probabilities_xgb"] = dir_head.get("directional_probabilities_xgb")
+        merged["mean_path_agreement_raw"] = round(float(mean_agree), 4)
+        merged["regression_agreement_score"] = round(float(regression_agree), 4)
+        merged["agreement_diagnostics"] = {
+            **(agreement_diag or {}),
+            "raw_mean_path_agreement": round(float(mean_agree), 4),
+            "directional_model_agreement": round(float(dir_model_agree), 4),
+        }
+        merged["combined_agreement_score"] = round(
+            float(combine_reg_dir_agreement(float(regression_agree), dir_model_agree)), 4
+        )
         merged["signal_strength_score"] = round(max(0.0, float(sig_strength)), 4)
         merged["volatility_regime"] = infer_volatility_regime_from_context(feature_context)
         merged["stability_score"] = float(stability_score)
@@ -682,6 +756,8 @@ class Predictor:
         merged["signal_cooldown_message"] = cooldown_msg
         merged["market_regime"] = market_regime_label
         merged["market_regime_confidence"] = round(market_regime_conf, 4)
+        merged["market_regime_effective"] = regime_trade
+        merged["market_regime_gating_applied"] = bool(use_regime_gating)
         if not feature_sanity_ok:
             merged["degraded_input"] = True
         log_v_hc = float(
@@ -700,46 +776,52 @@ class Predictor:
 
         fq_conf = str(merged.get("forecast_quality", "degraded"))
         sentiment_diag: dict[str, Any] = {}
-        raw_conf = compute_financial_confidence(
-            agreements,
-            lr_matrix,
-            metrics,
-            float(vol0),
-            forecast_quality=fq_conf,
-            fallback_mode=bool(merged.get("fallback_mode", True)),
-            artifact_mode=str(merged.get("artifact_mode", "legacy")),
-            guardrail_cumulative=bool(merged.get("realism_guardrail_cumulative")),
-            clip_saturation_fraction=float(merged.get("clip_saturation_step_fraction", 0.0)),
-            exact_feature_match=bool(merged.get("exact_feature_match", False)),
-            signal_strength=sig_strength,
-            directional_probs=dir_probs,
-            implied_horizon_log_return=implied_lr,
-            vol_regime_encoded=float(vr_enc) if vr_enc is not None else None,
-            trend_consistency_score=feature_context.get("trend_consistency_score"),
-            twitter_sentiment=feature_context.get("twitter_sentiment"),
-            twitter_volume=feature_context.get("twitter_volume"),
-            sentiment_diag_out=sentiment_diag,
-            chaotic_model_disagreement=chaotic,
+        merged["legacy_financial_confidence_raw"] = round(
+            float(
+                compute_financial_confidence(
+                    agreements,
+                    lr_matrix,
+                    metrics,
+                    float(vol0),
+                    forecast_quality=fq_conf,
+                    fallback_mode=bool(merged.get("fallback_mode", True)),
+                    artifact_mode=str(merged.get("artifact_mode", "legacy")),
+                    guardrail_cumulative=bool(merged.get("realism_guardrail_cumulative")),
+                    clip_saturation_fraction=float(merged.get("clip_saturation_step_fraction", 0.0)),
+                    exact_feature_match=bool(merged.get("exact_feature_match", False)),
+                    signal_strength=sig_strength,
+                    directional_probs=dir_probs,
+                    implied_horizon_log_return=implied_lr,
+                    vol_regime_encoded=float(vr_enc) if vr_enc is not None else None,
+                    trend_consistency_score=feature_context.get("trend_consistency_score"),
+                    twitter_sentiment=feature_context.get("twitter_sentiment"),
+                    twitter_volume=feature_context.get("twitter_volume"),
+                    sentiment_diag_out=sentiment_diag,
+                    chaotic_model_disagreement=chaotic,
+                )
+            ),
+            4,
         )
         merged.update(sentiment_diag)
-        base_confidence = finalize_forecast_confidence(
-            apply_confidence_penalty_caps(raw_conf, merged),
-            mean_path_agreement=mean_agree,
-            directional_probs=dir_probs,
+        effective_agree = float(merged.get("regression_agreement_score") or mean_agree)
+        comb_ag = float(merged.get("combined_agreement_score") or effective_agree)
+        hybrid_raw = compute_hybrid_primary_confidence(
+            float(merged.get("directional_confidence") or dir_conf_f),
+            comb_ag,
+            float(sig_strength),
+        )
+        base_confidence = finalize_hybrid_forecast_confidence(
+            apply_confidence_penalty_caps(hybrid_raw, merged),
             vol_regime=str(merged.get("volatility_regime") or "MEDIUM"),
         )
         merged["confidence_score_base"] = round(float(base_confidence), 4)
         vr_compose = str(merged.get("volatility_regime") or "MEDIUM")
-        risk_adj_base = compose_risk_adjusted_confidence(
+        risk_adj_base = compose_light_risk_adjusted_confidence(
             float(base_confidence),
-            mean_agree,
-            stability_score,
-            consensus_score,
-            trend_confirmation_score,
             volatility_regime_high=vr_compose.upper() == "HIGH",
             volatility_shock=shock,
             chaotic_disagreement=chaotic,
-            market_regime=market_regime_label,
+            market_regime=regime_trade,
         )
         merged["confidence_score_pre_decision_layer"] = round(float(risk_adj_base), 4)
         dec = compute_decision_bundle(
@@ -748,7 +830,7 @@ class Predictor:
             lower_bound=float(last["lower_bound"]),
             upper_bound=float(last["upper_bound"]),
             base_confidence=float(risk_adj_base),
-            mean_path_agreement=mean_agree,
+            mean_path_agreement=effective_agree,
             signal_strength_score=float(sig_strength),
             trend_label=str(trend_for_hc),
             directional_probs=dir_probs,
@@ -759,6 +841,7 @@ class Predictor:
             low_variance_warning=bool(merged.get("low_variance_warning")),
             coin=coin,
             trend_consistency_score=feature_context.get("trend_consistency_score"),
+            decision_gate_multiplier=float(decision_gate_multiplier),
         )
         merged["confidence_score"] = float(dec["confidence_after_decision"])
         merged["high_conviction"] = bool(dec["high_conviction"])
@@ -771,39 +854,55 @@ class Predictor:
         merged["directional_alignment"] = bool(dec["directional_alignment"])
         merged["decision_rejection_reasons"] = list(dec["decision_rejection_reasons"])
         merged["decision_explanation_append"] = format_trade_decision_explanation(
-            dec, mean_path_agreement=mean_agree
+            dec, mean_path_agreement=effective_agree
         )
         merged["trend_consistency_score"] = float(dec.get("trend_consistency_score", 0.0))
         merged["decision_threshold_scale"] = float(dec.get("decision_threshold_scale", 1.0))
         merged["recent_no_trade_fraction"] = float(dec.get("recent_no_trade_fraction", 0.0))
         merged["trade_missing_for_actionable"] = list(dec.get("trade_missing_for_actionable") or [])
 
-        trade_eval = evaluate_trade_opportunity({
-            "confidence_score": float(merged["confidence_score"]),
-            "mean_path_agreement": float(mean_agree),
-            "signal_strength_score": float(merged["signal_strength_score"]),
-            "directional_probabilities": dir_probs,
-            "volatility_regime": str(merged.get("volatility_regime") or "MEDIUM"),
-            "expected_move_pct": float(merged["expected_move_pct"]),
-            "risk_reward_ratio": float(merged["risk_reward_ratio"]),
-            "trend_label": str(trend_for_hc),
-            "forecast_bullish": forecast_bullish,
-            "sentiment_alignment": float(merged.get("sentiment_alignment", 0.0)),
-            "adx_14": feature_context.get("adx_14"),
-            "consensus_score": float(consensus_score),
-            "stability_score": float(stability_score),
-            "trend_confirmation_score": float(trend_confirmation_score),
-            "volatility_shock_detected": bool(shock),
-            "feature_sanity_failed": not feature_sanity_ok,
-            "signal_cooldown_active": bool(cooldown_block),
-            "market_regime": market_regime_label,
-            "market_regime_confidence": float(market_regime_conf),
-        })
+        if strict_trade_filter:
+            trade_eval = evaluate_trade_opportunity({
+                "confidence_score": float(merged.get("confidence_score_pre_decision_layer") or merged["confidence_score"]),
+                "mean_path_agreement": float(effective_agree),
+                "combined_agreement_score": float(merged.get("combined_agreement_score") or effective_agree),
+                "directional_confidence": float(merged.get("directional_confidence") or 0.0),
+                "signal_strength_score": float(merged["signal_strength_score"]),
+                "directional_probabilities": dir_probs,
+                "volatility_regime": str(merged.get("volatility_regime") or "MEDIUM"),
+                "expected_move_pct": float(merged["expected_move_pct"]),
+                "risk_reward_ratio": float(merged["risk_reward_ratio"]),
+                "trend_label": str(trend_for_hc),
+                "forecast_bullish": forecast_bullish,
+                "sentiment_alignment": float(merged.get("sentiment_alignment", 0.0)),
+                "adx_14": feature_context.get("adx_14"),
+                "consensus_score": float(consensus_score),
+                "stability_score": float(stability_score),
+                "trend_confirmation_score": float(trend_confirmation_score),
+                "volatility_shock_detected": bool(shock),
+                "feature_sanity_failed": not feature_sanity_ok,
+                "signal_cooldown_active": bool(cooldown_block),
+                "market_regime": regime_trade,
+                "market_regime_confidence": float(regime_conf_trade),
+            })
+        else:
+            tsig = str(dec.get("trade_signal", "NO_TRADE"))
+            if tsig == "BUY":
+                tdec = "STRONG_BUY" if bool(dec.get("high_conviction")) else "WEAK_BUY"
+            else:
+                tdec = "NO_TRADE"
+            trade_eval = {
+                "decision": tdec,
+                "score": float(dec.get("edge_score", 0.0)),
+                "reasons": ["decision_mode: strict trade filter disabled; mapped from decision_layer"],
+            }
         merged["trade_decision"] = str(trade_eval["decision"])
         merged["edge_score"] = float(trade_eval["score"])
         merged["trade_reasons"] = list(trade_eval["reasons"])
-        cd_days = int(os.environ.get("TRADE_COOLDOWN_DAYS", "3"))
-        register_actionable_signal(coin, merged["trade_decision"], cooldown_days=cd_days)
+        merged["strict_trade_filter_applied"] = bool(strict_trade_filter)
+        if register_signal_cooldown:
+            cd_days = int(os.environ.get("TRADE_COOLDOWN_DAYS", "3"))
+            register_actionable_signal(coin, merged["trade_decision"], cooldown_days=cd_days)
 
         return {
             "coin": coin,
@@ -823,6 +922,101 @@ class Predictor:
             "_mean_path_agreement": mean_agree,
             "_forecast_diagnostics": merged,
         }
+
+    def predict_from_latest_features(
+        self,
+        coin: str,
+        features_dir: Path | None = None,
+    ) -> dict[str, Any] | None:
+        """
+        Recursive 14-step forecast from latest feature parquet OHLCV history.
+        """
+        self._last_forecast_error = None
+        features_dir = Path(features_dir) if features_dir else settings.training.features_dir
+        refresh_data_if_needed(coin, features_dir=features_dir)
+        path = features_dir / f"{coin.replace(' ', '_')}_features.parquet"
+        if not path.exists():
+            logger.warning("Feature file not found: %s", path)
+            self._last_forecast_error = {
+                "code": "no_feature_file",
+                "message": f"Feature parquet not found: {path.name}",
+                "hint": "Run training pipeline or POST /api/refresh/{coin} to build features.",
+            }
+            return None
+        try:
+            df = pd.read_parquet(path)
+        except Exception as e:
+            logger.exception("Failed to load features for %s: %s", coin, e)
+            self._last_forecast_error = {
+                "code": "feature_load_failed",
+                "message": str(e),
+                "hint": "Check that the parquet file is readable and not corrupted.",
+            }
+            return None
+        if df.empty or len(df) < 80:
+            logger.warning("Insufficient history for %s", coin)
+            self._last_forecast_error = {
+                "code": "insufficient_history",
+                "message": f"Need at least 80 rows of history; got {len(df)}.",
+                "hint": "Fetch more historical data and rebuild features.",
+            }
+            return None
+        req = ["date", "open", "high", "low", "close", "volume"]
+        if not all(c in df.columns for c in req):
+            logger.warning("Feature file missing OHLCV columns for %s", coin)
+            self._last_forecast_error = {
+                "code": "missing_ohlcv_columns",
+                "message": f"Parquet must include columns: {req}",
+                "hint": "Regenerate features from OHLCV source data.",
+            }
+            return None
+
+        return self._run_full_forecast_pipeline(
+            coin,
+            df,
+            include_twitter=True,
+            use_regime_gating=True,
+            cooldown_active_override=None,
+            register_signal_cooldown=True,
+            strict_trade_filter=True,
+            decision_gate_multiplier=1.0,
+        )
+
+    def predict_for_backtest(
+        self,
+        coin: str,
+        ohlcv_df: pd.DataFrame,
+        *,
+        include_twitter: bool = True,
+        include_regime_filter: bool = True,
+        cooldown_active_override: bool | None = None,
+        register_cooldown: bool = False,
+        decision_mode: str = "trade_decision",
+    ) -> dict[str, Any] | None:
+        """
+        Same pipeline as live inference, for walk-forward simulation on a truncated OHLCV frame.
+
+        ``cooldown_active_override``: when not None, replaces disk-backed cooldown read
+        (backtest should pass the simulated cooldown flag per day).
+        """
+        self._last_forecast_error = None
+        mode = (decision_mode or "trade_decision").strip().lower().replace("-", "_")
+        if mode in ("decision_layer_only", "prediction_only"):
+            strict, mult = False, 1.0
+        elif mode in ("weaker_thresholds", "relaxed_gates"):
+            strict, mult = True, 0.88
+        else:
+            strict, mult = True, 1.0
+        return self._run_full_forecast_pipeline(
+            coin,
+            ohlcv_df,
+            include_twitter=include_twitter,
+            use_regime_gating=include_regime_filter,
+            cooldown_active_override=cooldown_active_override,
+            register_signal_cooldown=register_cooldown,
+            strict_trade_filter=strict,
+            decision_gate_multiplier=mult,
+        )
 
     def forecast_path(
         self,
@@ -1090,6 +1284,7 @@ class Predictor:
                 "sanity_check": diag.get("sanity_check") or {},
                 "step0_raw_logret_by_model": diag.get("step0_raw_logret_by_model") or {},
                 "model_horizon_variance_raw": diag.get("model_horizon_variance_raw") or {},
+                "agreement_diagnostics": diag.get("agreement_diagnostics") or {},
                 "ensemble_log_return_var": float(diag.get("ensemble_log_return_var", 0.0)),
                 "price_relative_variance": float(diag.get("price_relative_variance", 0.0)),
                 "max_missing_feature_fill_ratio": float(diag.get("max_missing_feature_fill_ratio", 0.0)),
@@ -1114,6 +1309,10 @@ class Predictor:
             else bool(diag.get("high_conviction", False)),
             "signal_strength_score": float(diag.get("signal_strength_score") or 0.0),
             "directional_probabilities": dict(diag.get("directional_probabilities") or {}),
+            "directional_confidence": float(diag.get("directional_confidence") or 0.0),
+            "combined_agreement_score": float(
+                diag.get("combined_agreement_score") or mean_agree
+            ),
             "volatility_regime": str(
                 diag.get("volatility_regime") or infer_volatility_regime_from_context(fc_ctx)
             ),

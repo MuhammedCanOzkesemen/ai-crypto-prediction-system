@@ -35,7 +35,7 @@ Supporting cross-cutting packages: **`utils/`** (config, constants, logging), **
 | `api/` | FastAPI app, Pydantic response models, routes under `/predictions`, `/api/*`, static dashboard mount. |
 | `dashboard/` | Client UI: forecast table, chart (Plotly), regime, risk strip, trade signal. |
 | `scripts/train_pipeline.py` | End-to-end train: fetch → features → fit → evaluate → write artifacts. |
-| `evaluation/` | Metric computation and backtest scripts (consumes saved features / labels). |
+| `evaluation/` | Model metrics, walk-forward **model** backtest (`backtest.py`), **trade** backtest (`trade_backtest.py`), execution sim (`trade_execution.py`), metrics (`backtest_metrics.py`), ablation (`ablation.py`). |
 
 ---
 
@@ -51,22 +51,24 @@ Supporting cross-cutting packages: **`utils/`** (config, constants, logging), **
 
 ### 4.1 Entry point
 
-`Predictor.predict_from_latest_features(coin)`:
+`Predictor.predict_from_latest_features(coin)` delegates to **`Predictor._run_full_forecast_pipeline`** with live defaults (Twitter on, regime gating on, disk cooldown, strict trade filter, `decision_gate_multiplier=1.0`). **`Predictor.predict_for_backtest`** calls the same core with overrides for research (optional neutral Twitter via `coin=None` in `build_features`, optional neutral regime for gating, simulated cooldown flag, no disk cooldown write, optional `decision_mode` for weaker gates or decision-layer-only tiers).
 
-1. Loads coin feature parquet (must include OHLCV columns).  
+Pipeline steps:
+
+1. Loads coin feature parquet (must include OHLCV columns) — or receives an OHLCV-only frame in backtest mode; feature context and directional head use `full_feat` when present.  
 2. Loads models + scaler bundle + `training_metadata.json`.  
-3. Builds `full_feat` = `build_features` on recent history tail.  
+3. Builds `full_feat` = `build_features` on recent history tail (`coin=None` disables Twitter merge for ablations).  
 4. **Feature sanity** (`prediction/feature_sanity.py`) on the latest row.  
 5. **Multi-day consensus** — three truncated histories; `_ensemble_one_step_log_return` per cutoff (`prediction/multi_day_consensus.py`).  
-6. **Cooldown** read (`prediction/signal_cooldown.py`).  
-7. **Market regime** — `detect_market_regime(full_feat)` (`prediction/market_regime.py`).  
+6. **Cooldown** — live: `signal_cooldown.cooldown_active`; backtest: boolean override per simulated day.  
+7. **Market regime** — `detect_market_regime(full_feat)`; diagnostics always store detected regime; gating for confidence/trade filter can be forced to `RANGING` when `use_regime_gating=False`.  
 8. **Recursive forecast** — 14 steps, daily caps, per-step model agreement (`prediction/realism.py`, `recursive_forecast.py`).  
 9. From the path: **stability score**, **LR-matrix chaotic disagreement**, **volatility shock** vs EWMA history, **trend confirmation** (EMA20/50, ADX persistence).  
 10. **Financial confidence** — `compute_financial_confidence` in `forecast_intel.py` (includes optional chaotic penalty, Twitter sentiment block).  
-11. **Finalize** then **risk-adjusted confidence** — `compose_risk_adjusted_confidence` in `trading_validation.py` (regime: VOLATILE ×0.75, TRENDING ×1.05, RANGING ×0.96; caps for shock/high vol/chaos).  
-12. **Decision layer** — `decision_layer.compute_decision_bundle` (legacy `trade_signal`, edge from structural formula, `confidence_after_decision`).  
-13. **Trade filter** — `trade_filter.evaluate_trade_opportunity` (strict `trade_decision`, product-based `edge_score` overwrite on diagnostics).  
-14. **Cooldown register** when `trade_decision` is `STRONG_BUY` or `WEAK_BUY` and cooldown not already active.
+11. **Finalize** then **risk-adjusted confidence** — `compose_risk_adjusted_confidence` in `trading_validation.py` (effective regime for multipliers follows gating; caps for shock/high vol/chaos).  
+12. **Decision layer** — `decision_layer.compute_decision_bundle` (optional `decision_gate_multiplier` for relaxed research gates).  
+13. **Trade filter** — `trade_filter.evaluate_trade_opportunity` unless `strict_trade_filter=False` (maps `trade_signal` BUY to strong/weak tier for ablation F).  
+14. **Cooldown register** (live only) when `trade_decision` is actionable — backtests set `register_signal_cooldown=False` and simulate cooldown in the outer loop.
 
 ### 4.2 Recursive forecast
 
@@ -124,7 +126,8 @@ Consumers should treat **`trade_decision`** as the primary strict label for rese
 - `GET /predictions/{coin}` — Compact prediction + diagnostics subset.  
 - `GET /api/forecast-path/{coin}` — Full path, multi-horizon summary, extended diagnostics.  
 - `POST /api/refresh/{coin}` — Force OHLCV + feature rebuild.  
-- `GET /api/chart/{coin}`, `GET /api/evaluation/{coin}` — Chart and metric summaries.
+- `GET /api/chart/{coin}`, `GET /api/evaluation/{coin}` — Chart and metric summaries.  
+- `GET /api/backtest/{coin}` — Latest saved **`artifacts/backtests/{Coin}_summary.json`** from an offline `scripts/run_backtest.py` run (404 if missing).
 
 Response models include: regime fields, stability, consensus, trend confirmation, shock flag, Twitter sentiment diagnostics, trade decision, edge score.
 
@@ -135,13 +138,28 @@ Response models include: regime fields, stability, consensus, trend confirmation
 - **Models / scaler:** `artifacts/models/{Coin}/`  
 - **Features parquet:** configured `features_dir` (often `artifacts/features/`).  
 - **Twitter cache:** under artifact root `cache/twitter_sentiment/`.  
-- **Signal cooldown:** `cache/signal_cooldown/{slug}.json`.
+- **Signal cooldown:** `cache/signal_cooldown/{slug}.json`.  
+- **Trade backtests:** `backtests/{Coin}_trades.csv`, `{Coin}_equity_curve.csv`, `{Coin}_summary.json`, optional `{Coin}_ablation.csv`, `backtest_leaderboard.csv`.
 
 ---
 
-## 10. Testing
+## 10. Trade Backtest and Ablation (Research)
 
-`tests/` covers decision layer, forecast intel disagreement behavior, signal contracts, trade filter, trading validation helpers, and market regime classification. Run:
+**Modules:** `evaluation/trade_backtest.py`, `evaluation/trade_execution.py`, `evaluation/backtest_metrics.py`, `evaluation/ablation.py`, CLI `scripts/run_backtest.py`.
+
+**No leakage:** For each simulated calendar day `t`, the predictor receives `ohlcv.iloc[: t+1]` only. Twitter-off ablations use `build_features(..., coin=None)` so sentiment columns are neutral for that slice. Cooldown in simulation does not read the live JSON file when the override is supplied.
+
+**Execution (daily bars):** Entry at the **next** bar’s **open** after a `STRONG_BUY` / `WEAK_BUY`. STRONG: stop −2%, take-profit +3%, up to 3 sessions. WEAK: stop −1.5%, take-profit +2%, 1 session. Intraday touch uses `high`/`low`; if both stop and profit levels lie inside the same bar’s range, **stop is assumed first** (conservative long). Gap opens through a level exit at **open**.
+
+**Metrics:** Trade list P&L, compounded equity, drawdown on the daily equity series, Sharpe/Sortino on daily simple returns, profit factor, regime-stratified returns, and health counters (signal frequency, cooldown days, coarse rejection buckets from text reasons).
+
+**Ablation:** Six rows (A–F) written to `{Coin}_ablation.csv` with aligned columns for quick comparison.
+
+---
+
+## 11. Testing
+
+`tests/` covers decision layer, forecast intel disagreement behavior, signal contracts, trade filter, trading validation helpers, market regime classification, and trade execution / ablation CSV shape. Run:
 
 ```bash
 python -m unittest discover -s tests -p "test_*.py" -v
@@ -149,7 +167,7 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 ---
 
-## 11. Design Principles
+## 12. Design Principles
 
 - **One-way dependencies:** `features` does not import `prediction`; `api` calls `prediction` only at the edge.  
 - **Versioned schema:** Feature or target changes bump `FEATURE_SCHEMA_VERSION` and require retraining.  

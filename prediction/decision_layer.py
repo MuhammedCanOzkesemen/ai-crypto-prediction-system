@@ -16,6 +16,22 @@ _NO_TRADE_WINDOW = 96
 _signal_history: dict[str, deque[int]] = {}
 _hist_lock = Lock()
 
+
+def clear_signal_history(coin: str | None = None) -> None:
+    """
+    Reset rolling NO_TRADE history used by adaptive thresholds.
+
+    Call with a coin display name to clear one series; call with None to clear all
+    (e.g. before a reproducible walk-forward backtest).
+    """
+    with _hist_lock:
+        if not coin or not str(coin).strip():
+            _signal_history.clear()
+            return
+        key = str(coin).strip()
+        _signal_history.pop(key, None)
+
+
 # ---------------------------------------------------------------------------
 # Thresholds (conservative; tune without touching models)
 # ---------------------------------------------------------------------------
@@ -270,7 +286,8 @@ def apply_trade_aware_confidence(
     """
     Pull confidence toward trade reliability: weak setups → lower displayed confidence.
 
-    Uses the same gates' geometry without double-counting finalize_forecast_confidence.
+    Uses the same gates' geometry as a mild shade on top of model confidence rather than
+    a second full confidence composition pass.
     """
     bc = float(max(0.0, min(1.0, base_confidence)))
     e = float(max(0.0, min(1.0, edge_score)))
@@ -292,7 +309,8 @@ def apply_trade_aware_confidence(
         + 0.09 * tc
     )
     rel = float(max(0.38, min(1.0, rel)))
-    out = bc * rel
+    # Keep displayed confidence tied primarily to model conviction; trade reliability only trims.
+    out = bc * (0.80 + 0.20 * rel)
     return float(max(0.0, min(1.0, out)))
 
 
@@ -337,6 +355,7 @@ def compute_decision_bundle(
     low_variance_warning: bool = False,
     coin: str | None = None,
     trend_consistency_score: float | None = None,
+    decision_gate_multiplier: float = 1.0,
 ) -> dict[str, Any]:
     """
     Full decision payload for API + predictor diagnostics.
@@ -371,12 +390,13 @@ def compute_decision_bundle(
     rr_eff = risk_reward_effective_for_gate(rr_raw, vr)
     nt_frac = recent_no_trade_fraction(coin)
     thr_scale = adaptive_threshold_scale(vr, tc_score, nt_frac)
+    gm = float(max(0.72, min(1.0, decision_gate_multiplier)))
     rr_base = MIN_RISK_REWARD_RATIO_HIGH_VOL if vr == "HIGH" else MIN_RISK_REWARD_RATIO
-    rr_need = float(rr_base * thr_scale)
-    edge_need = float((MIN_EDGE_SCORE_TRADE + (0.07 if vr == "HIGH" else 0.0)) * thr_scale)
-    min_conf = float(MIN_CONFIDENCE_TRADE * thr_scale)
-    min_agree = float(MIN_MEAN_PATH_AGREEMENT_TRADE * thr_scale)
-    min_ss = float(MIN_SIGNAL_STRENGTH_TRADE * thr_scale)
+    rr_need = float(rr_base * thr_scale * gm)
+    edge_need = float((MIN_EDGE_SCORE_TRADE + (0.07 if vr == "HIGH" else 0.0)) * thr_scale * gm)
+    min_conf = float(MIN_CONFIDENCE_TRADE * thr_scale * gm)
+    min_agree = float(MIN_MEAN_PATH_AGREEMENT_TRADE * thr_scale * gm)
+    min_ss = float(MIN_SIGNAL_STRENGTH_TRADE * thr_scale * gm)
 
     ps = prediction_sign(cp, fp)
     aligned = compute_directional_alignment(cp, fp, trend_label, directional_probs)

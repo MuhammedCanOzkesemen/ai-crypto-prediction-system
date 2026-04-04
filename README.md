@@ -29,6 +29,8 @@ This is **not** automated live trading out of the box: there is no order router,
 | **Confidence** | Financial confidence from path metrics, then **risk-adjusted** composition (agreement, stability, consensus, trend confirm) with regime multipliers and hard caps under shock/chaos/high vol. |
 | **Volatility shock** | Flags when short-term EWMA vol materially exceeds recent history (default ratio threshold ~1.8×). |
 | **Signal cooldown** | Per-coin cooldown file after actionable tiers to limit over-trading (`TRADE_COOLDOWN_DAYS`, default 3). |
+| **Trade backtest** | Walk-forward simulation with next-bar entry, SL/TP/time exits, CSV trade log, equity curve, regime breakdown, strategy health metrics. |
+| **Ablation lab** | Six fixed variants (full / no Twitter / no regime gating / no cooldown / weaker gates / decision-layer-only) for comparable CSV summaries. |
 
 ---
 
@@ -45,8 +47,9 @@ Data → Features → Models → Validation → Decision → API → Dashboard
 3. **Models** — Per-coin trained regressors (next-day log return); scaler + metadata on disk.  
 4. **Validation** — Recursive 14-step path, stability/consensus/shock/trend checks, regime detection.  
 5. **Decision** — Legacy BUY/SELL/NO_TRADE filter plus strict `trade_decision` tiers and edge score.  
-6. **API** — FastAPI: `/predictions/{coin}`, `/api/forecast-path/{coin}`, health, refresh, chart, evaluation.  
-7. **Dashboard** — Static UI: forecast path, regime, risk indicators, trade signal block.
+6. **API** — FastAPI: `/predictions/{coin}`, `/api/forecast-path/{coin}`, health, refresh, chart, evaluation, saved `/api/backtest/{coin}`.  
+7. **Dashboard** — Static UI: forecast path, regime, risk indicators, trade signal block.  
+8. **Research** — Offline `scripts/run_backtest.py` writes `artifacts/backtests/*` (trades, equity, summary JSON, optional ablation and leaderboard).
 
 See **ARCHITECTURE.md** for module-level detail and data flow.
 
@@ -148,11 +151,38 @@ python -m uvicorn api.app:app --host 127.0.0.1 --port 8010
 curl -X POST http://127.0.0.1:8010/api/refresh/Bitcoin
 ```
 
+**Trade backtest (offline; requires trained models + feature parquet):**
+
+```bash
+python scripts/run_backtest.py --coin Bitcoin
+python scripts/run_backtest.py --coin PEPE --start 2024-01-01 --end 2025-12-31
+python scripts/run_backtest.py --all
+python scripts/run_backtest.py --coin Bitcoin --ablation
+```
+
+Artifacts (default under `artifacts/backtests/`): `{Coin}_trades.csv`, `{Coin}_equity_curve.csv`, `{Coin}_summary.json`, optional `{Coin}_ablation.csv`, `backtest_leaderboard.csv` for `--all`.
+
+After a backtest, the API can serve the saved summary (no on-request simulation):
+
+```bash
+curl http://127.0.0.1:8010/api/backtest/Bitcoin
+```
+
+---
+
+## Backtesting, Evaluation, and Ablation
+
+- **Engine** — `evaluation/trade_backtest.py` runs `Predictor.predict_for_backtest` day by day on history truncated to each decision date (no future feature rows). Execution uses post-entry OHLC only (realized path).  
+- **Metrics** — Win rate, compounded return, drawdown, Sharpe/Sortino on daily equity returns, profit factor, expectancy, exposure, per-regime P&L breakdown, and NO_TRADE diagnostics (cooldown share, rejection buckets).  
+- **Ablation** — `evaluation/ablation.py` runs variants A–F into `{Coin}_ablation.csv` for side-by-side research.
+
+See **ARCHITECTURE.md** for assumptions (daily bars, stop-first rule when both levels trade through).
+
 ---
 
 ## Future Work
 
-- **Backtesting** — Walk-forward evaluation wired to the same decision and confidence stack as live inference.  
+- **Execution realism** — Intraday paths, fees, slippage, and partial fills beyond daily OHLC.  
 - **Live trading** — Execution adapter, order management, and portfolio risk (not included here).  
 - **Reinforcement learning** — Optional policy layer on top of features and regime state (research-grade extension).
 

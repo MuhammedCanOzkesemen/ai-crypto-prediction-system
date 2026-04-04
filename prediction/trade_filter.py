@@ -67,6 +67,8 @@ def evaluate_trade_opportunity(prediction_output: dict[str, Any]) -> dict[str, A
 
     conf = float(prediction_output.get("confidence_score") or 0.0)
     agree = float(prediction_output.get("mean_path_agreement") or 0.0)
+    comb_agree = float(prediction_output.get("combined_agreement_score") or agree)
+    dir_conf = float(prediction_output.get("directional_confidence") or 0.0)
     sig = float(prediction_output.get("signal_strength_score") or 0.0)
     probs = prediction_output.get("directional_probabilities")
     if not isinstance(probs, dict):
@@ -97,7 +99,7 @@ def evaluate_trade_opportunity(prediction_output: dict[str, Any]) -> dict[str, A
         adx = 0.0
 
     reasons: list[str] = []
-    base_score = compute_trade_engine_edge_score(conf, agree, sig)
+    base_score = compute_trade_engine_edge_score(conf, comb_agree, sig)
     score = base_score
 
     if cooldown:
@@ -108,9 +110,20 @@ def evaluate_trade_opportunity(prediction_output: dict[str, Any]) -> dict[str, A
         reasons.append("Feature sanity check failed — forced NO_TRADE")
         return {"decision": "NO_TRADE", "score": float(round(score * 0.85, 6)), "reasons": reasons}
 
-    # Hard veto (critical)
-    if conf < 0.35 or agree < 0.30:
-        reasons.append("Hard filter: confidence < 0.35 or mean path agreement < 0.30")
+    # Hard veto (critical) — relaxed vs legacy stack; hybrid confidence uses directional + agreement blend
+    if conf < 0.22 or agree < 0.22:
+        reasons.append("Hard filter: confidence < 0.22 or mean path agreement < 0.22")
+        return {"decision": "NO_TRADE", "score": float(round(score, 6)), "reasons": reasons}
+
+    # Directional intelligence gates (hybrid system)
+    if dir_conf <= 0.55:
+        reasons.append("Directional gate: max directional probability must exceed 0.55")
+        return {"decision": "NO_TRADE", "score": float(round(score, 6)), "reasons": reasons}
+    if comb_agree <= 0.45:
+        reasons.append("Combined agreement gate: regression+directional agreement must exceed 0.45")
+        return {"decision": "NO_TRADE", "score": float(round(score, 6)), "reasons": reasons}
+    if em <= 0.015:
+        reasons.append("Expected move gate: horizon move must exceed 1.5%")
         return {"decision": "NO_TRADE", "score": float(round(score, 6)), "reasons": reasons}
 
     if market_regime == "VOLATILE":
