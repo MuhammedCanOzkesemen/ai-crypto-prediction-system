@@ -12,10 +12,12 @@ import os
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from unittest.mock import patch
 
 from evaluation.backtest_metrics import (
     compute_trade_statistics,
@@ -32,6 +34,7 @@ logger = get_logger(__name__)
 
 REQ = ["date", "open", "high", "low", "close", "volume"]
 MIN_HISTORY = 80
+ACTIONABLE_DECISIONS = ("STRONG_BUY", "WEAK_BUY", "PROBING_BUY")
 
 
 def backtests_dir() -> Path:
@@ -63,6 +66,26 @@ def load_ohlcv_frame(coin: str, features_dir: Path | None = None) -> pd.DataFram
     return out.sort_values("date").reset_index(drop=True)
 
 
+def load_feature_parquet_frame(coin: str, features_dir: Path | None = None) -> pd.DataFrame | None:
+    """Load the raw feature parquet so live-style inference can be replayed on a truncated slice."""
+    fd = Path(features_dir) if features_dir else settings.training.features_dir
+    path = fd / f"{_slug(coin)}_features.parquet"
+    if not path.exists():
+        logger.warning("Missing features parquet: %s", path)
+        return None
+    try:
+        df = pd.read_parquet(path)
+    except Exception as e:
+        logger.exception("Failed to read %s: %s", path, e)
+        return None
+    if "date" not in df.columns:
+        logger.warning("Feature parquet missing date column: %s", path)
+        return None
+    out = df.copy()
+    out["date"] = pd.to_datetime(out["date"])
+    return out.sort_values("date").reset_index(drop=True)
+
+
 def _bucket_rejection(dec_reasons: list[str], trade_reasons: list[str]) -> str | None:
     blob = " ".join(dec_reasons + trade_reasons).lower()
     if "cooldown" in blob:
@@ -90,6 +113,215 @@ def _safe_avg(xs: list[float]) -> float | None:
     if not xs:
         return None
     return float(np.mean(xs))
+
+
+def _extract_decision_snapshot(raw: dict[str, Any] | None) -> dict[str, Any]:
+    diag = (raw or {}).get("_forecast_diagnostics") or {}
+    return {
+        "confidence_score": float(diag.get("confidence_score", 0.0) or 0.0),
+        "directional_confidence": float(diag.get("directional_confidence", 0.0) or 0.0),
+        "combined_agreement_score": float(diag.get("combined_agreement_score", 0.0) or 0.0),
+        "trade_decision": str(diag.get("trade_decision", "NO_TRADE")),
+        "decision_blockers": dict(diag.get("decision_blockers") or {}),
+        "trade_reasons": list(diag.get("trade_reasons") or []),
+        "decision_summary": dict(diag.get("decision_summary") or {}),
+    }
+
+
+def _prime_decision_state(
+    predictor: Predictor,
+    coin: str,
+    df: pd.DataFrame,
+    target_date: pd.Timestamp,
+    *,
+    include_twitter: bool,
+    include_regime_filter: bool,
+    decision_mode: str,
+    include_cooldown: bool,
+) -> bool:
+    """
+    Replay prior dates so decision history and cooldown state match the walk-forward backtest.
+    Returns whether cooldown should be active on ``target_date``.
+    """
+    clear_signal_history(coin)
+    cd_days = int(os.environ.get("TRADE_COOLDOWN_DAYS", "3"))
+    cooldown_until: date | None = None
+
+    for idx in range(len(df)):
+        ts = pd.Timestamp(df.iloc[idx]["date"]).normalize()
+        if ts >= target_date:
+            break
+        if idx < MIN_HISTORY - 1:
+            continue
+        d_only = ts.date()
+        cooldown_active_now = bool(include_cooldown and cooldown_until is not None and d_only <= cooldown_until)
+        hist = df.iloc[: idx + 1].copy()
+        raw = predictor.predict_for_backtest(
+            coin,
+            hist,
+            include_twitter=include_twitter,
+            include_regime_filter=include_regime_filter,
+            cooldown_active_override=cooldown_active_now,
+            register_cooldown=False,
+            decision_mode=decision_mode,
+        )
+        snapshot = _extract_decision_snapshot(raw)
+        if include_cooldown and snapshot["trade_decision"] in ACTIONABLE_DECISIONS:
+            cooldown_until = d_only + timedelta(days=cd_days)
+
+    return bool(include_cooldown and cooldown_until is not None and target_date.date() <= cooldown_until)
+
+
+def _execution_profile_for_decision(decision: str) -> tuple[float, float, int]:
+    if decision == "STRONG_BUY":
+        return 0.02, 0.03, 3
+    # PROBING_BUY is a lighter conviction tier, so reuse the shortest existing weak profile.
+    return 0.015, 0.02, 1
+
+
+def compare_live_and_backtest_prediction(
+    coin: str,
+    as_of_date: str,
+    *,
+    decision_mode: str = "trade_decision",
+    include_twitter: bool = True,
+    include_regime_filter: bool = True,
+    include_cooldown: bool = True,
+    features_dir: Path | None = None,
+    models_dir: Path | None = None,
+    evaluation_dir: Path | None = None,
+) -> dict[str, Any]:
+    """
+    Run the live entrypoint and backtest entrypoint against the same truncated history and compare
+    the core decision diagnostics. Mismatches are logged with detailed context.
+    """
+    features_dir = Path(features_dir) if features_dir else settings.training.features_dir
+    target_date = pd.Timestamp(as_of_date).normalize()
+    full_feature_df = load_feature_parquet_frame(coin, features_dir)
+    if full_feature_df is None or full_feature_df.empty:
+        return {
+            "coin": coin,
+            "as_of_date": target_date.strftime("%Y-%m-%d"),
+            "error": "missing_feature_parquet",
+        }
+
+    date_series = pd.to_datetime(full_feature_df["date"]).dt.normalize()
+    truncated_feature_df = full_feature_df.loc[date_series <= target_date].copy()
+    if truncated_feature_df.empty:
+        return {
+            "coin": coin,
+            "as_of_date": target_date.strftime("%Y-%m-%d"),
+            "error": "no_rows_before_date",
+        }
+    if not all(c in truncated_feature_df.columns for c in REQ):
+        return {
+            "coin": coin,
+            "as_of_date": target_date.strftime("%Y-%m-%d"),
+            "error": "missing_ohlcv_columns",
+        }
+
+    hist = truncated_feature_df[REQ].copy().reset_index(drop=True)
+    if len(hist) < MIN_HISTORY:
+        return {
+            "coin": coin,
+            "as_of_date": target_date.strftime("%Y-%m-%d"),
+            "error": "insufficient_history",
+            "rows": len(hist),
+        }
+
+    predictor = Predictor(models_dir=models_dir, evaluation_dir=evaluation_dir)
+    if not predictor.load_models(coin):
+        return {
+            "coin": coin,
+            "as_of_date": target_date.strftime("%Y-%m-%d"),
+            "error": "no_models",
+        }
+
+    cooldown_active_now = _prime_decision_state(
+        predictor,
+        coin,
+        hist,
+        target_date,
+        include_twitter=include_twitter,
+        include_regime_filter=include_regime_filter,
+        decision_mode=decision_mode,
+        include_cooldown=include_cooldown,
+    )
+
+    clear_signal_history(coin)
+    _prime_decision_state(
+        predictor,
+        coin,
+        hist,
+        target_date,
+        include_twitter=include_twitter,
+        include_regime_filter=include_regime_filter,
+        decision_mode=decision_mode,
+        include_cooldown=include_cooldown,
+    )
+    with TemporaryDirectory() as tmpdir_s:
+        tmpdir = Path(tmpdir_s)
+        temp_path = tmpdir / f"{_slug(coin)}_features.parquet"
+        truncated_feature_df.to_parquet(temp_path, index=False)
+        with patch("prediction.predictor.cooldown_active", return_value=(cooldown_active_now, None)):
+            with patch("prediction.predictor.register_actionable_signal", return_value=None):
+                live_raw = predictor.predict_from_latest_features(coin, features_dir=tmpdir)
+    live_sig = _extract_decision_snapshot(live_raw)
+
+    clear_signal_history(coin)
+    _prime_decision_state(
+        predictor,
+        coin,
+        hist,
+        target_date,
+        include_twitter=include_twitter,
+        include_regime_filter=include_regime_filter,
+        decision_mode=decision_mode,
+        include_cooldown=include_cooldown,
+    )
+    backtest_raw = predictor.predict_for_backtest(
+        coin,
+        hist,
+        include_twitter=include_twitter,
+        include_regime_filter=include_regime_filter,
+        cooldown_active_override=cooldown_active_now,
+        register_cooldown=False,
+        decision_mode=decision_mode,
+    )
+    backtest_sig = _extract_decision_snapshot(backtest_raw)
+
+    keys = ("confidence_score", "directional_confidence", "combined_agreement_score", "trade_decision")
+    mismatches: dict[str, Any] = {}
+    for key in keys:
+        lv = live_sig.get(key)
+        bv = backtest_sig.get(key)
+        if isinstance(lv, float) or isinstance(bv, float):
+            if abs(float(lv) - float(bv)) > 1e-9:
+                mismatches[key] = {"live": lv, "backtest": bv}
+        elif lv != bv:
+            mismatches[key] = {"live": lv, "backtest": bv}
+
+    if mismatches:
+        logger.warning(
+            "Live/backtest mismatch for %s on %s: %s | live=%s | backtest=%s",
+            coin,
+            target_date.strftime("%Y-%m-%d"),
+            mismatches,
+            live_sig,
+            backtest_sig,
+        )
+    else:
+        logger.info("Live/backtest parity confirmed for %s on %s", coin, target_date.strftime("%Y-%m-%d"))
+
+    return {
+        "coin": coin,
+        "as_of_date": target_date.strftime("%Y-%m-%d"),
+        "cooldown_active": cooldown_active_now,
+        "matches": not mismatches,
+        "mismatches": mismatches,
+        "live": live_sig,
+        "backtest": backtest_sig,
+    }
 
 
 def run_trade_backtest(
@@ -142,6 +374,7 @@ def run_trade_backtest(
         "no_trade_days": 0,
         "strong_buy_signals": 0,
         "weak_buy_signals": 0,
+        "probing_buy_signals": 0,
         "actionable_signal_days": 0,
         "blocked_cooldown_days": 0,
         "rejection_buckets": defaultdict(int),
@@ -149,7 +382,7 @@ def run_trade_backtest(
     }
 
     regime_returns: dict[str, list[float]] = defaultdict(list)
-    strong_count = weak_count = 0
+    strong_count = weak_count = probing_count = 0
     last_signal_idx: int | None = None
     signal_gaps: list[int] = []
 
@@ -196,8 +429,10 @@ def run_trade_backtest(
             health["strong_buy_signals"] += 1
         elif td == "WEAK_BUY":
             health["weak_buy_signals"] += 1
+        elif td == "PROBING_BUY":
+            health["probing_buy_signals"] += 1
 
-        if td in ("STRONG_BUY", "WEAK_BUY"):
+        if td in ACTIONABLE_DECISIONS:
             health["actionable_signal_days"] += 1
             health["signal_dates"].append(ts.isoformat())
             if last_signal_idx is not None:
@@ -237,12 +472,10 @@ def run_trade_backtest(
         })
 
         can_open = pos is None
-        if can_open and raw is not None and td in ("STRONG_BUY", "WEAK_BUY"):
+        if can_open and raw is not None and td in ACTIONABLE_DECISIONS:
             entry_i = idx + 1
             if entry_i < len(df):
-                sl_pct = 0.02 if td == "STRONG_BUY" else 0.015
-                tp_pct = 0.03 if td == "STRONG_BUY" else 0.02
-                max_bars = 3 if td == "STRONG_BUY" else 1
+                sl_pct, tp_pct, max_bars = _execution_profile_for_decision(td)
                 sim = simulate_long_trade_daily_ohlc(
                     df, entry_i, stop_loss_pct=sl_pct, take_profit_pct=tp_pct, max_holding_bars=max_bars
                 )
@@ -258,8 +491,10 @@ def run_trade_backtest(
                     shares = cash_equity / entry_px
                     if td == "STRONG_BUY":
                         strong_count += 1
-                    else:
+                    elif td == "WEAK_BUY":
                         weak_count += 1
+                    else:
+                        probing_count += 1
                     reg = str(diag.get("market_regime", "RANGING"))
                     regime_returns[reg].append(ret)
                     exit_idx = int(sim["exit_row_index"])
@@ -301,6 +536,7 @@ def run_trade_backtest(
         "signal_frequency": health["actionable_signal_days"] / de,
         "strong_signal_frequency": health["strong_buy_signals"] / de,
         "weak_signal_frequency": health["weak_buy_signals"] / de,
+        "probing_signal_frequency": health["probing_buy_signals"] / de,
         "average_time_between_signals": float(np.mean(signal_gaps)) if signal_gaps else None,
         "percentage_days_blocked_by_cooldown": health["blocked_cooldown_days"] / de,
         "percentage_no_trade": health["no_trade_days"] / de,
@@ -315,6 +551,7 @@ def run_trade_backtest(
     stats = compute_trade_statistics(trade_returns, equity_daily=eq_arr if len(eq_arr) else None, daily_returns=er)
     stats["strong_buy_trades"] = strong_count
     stats["weak_buy_trades"] = weak_count
+    stats["probing_buy_trades"] = probing_count
     stats["no_trade_days"] = health["no_trade_days"]
     stats["average_holding_days"] = _safe_avg([float(r["holding_days"]) for r in trade_rows if r.get("holding_days") is not None])
     stats["exposure_ratio"] = float(in_pos_days / de) if de else 0.0
@@ -364,6 +601,7 @@ def run_trade_backtest(
             "stop_take_profit": "intraday_high_low; if both hit same bar assume_stop_first",
             "strong_buy": {"stop_loss_pct": 0.02, "take_profit_pct": 0.03, "max_holding_sessions": 3},
             "weak_buy": {"stop_loss_pct": 0.015, "take_profit_pct": 0.02, "max_holding_sessions": 1},
+            "probing_buy": {"stop_loss_pct": 0.015, "take_profit_pct": 0.02, "max_holding_sessions": 1},
         },
     }
 

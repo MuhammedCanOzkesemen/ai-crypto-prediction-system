@@ -96,7 +96,7 @@ class CoinPredictionResponse(BaseModel):
     trade_signal: str = Field("NO_TRADE", description="BUY | SELL | NO_TRADE (legacy decision layer)")
     trade_decision: str = Field(
         "NO_TRADE",
-        description="Strict engine: STRONG_BUY | WEAK_BUY | NO_TRADE",
+        description="Strict engine: STRONG_BUY | WEAK_BUY | PROBING_BUY | NO_TRADE",
     )
     trade_reasons: list[str] = Field(
         default_factory=list,
@@ -164,6 +164,8 @@ class MarketScannerRow(BaseModel):
     volatility_regime: str = Field("UNKNOWN")
     signal_strength_score: float = Field(0.0, ge=0.0, le=1.0)
     directional_probabilities: dict[str, float] = Field(default_factory=dict)
+    market_score: float = Field(0.0, ge=0.0, le=1.0)
+    top_opportunity_rank: int | None = None
 
 
 class HealthResponse(BaseModel):
@@ -267,14 +269,24 @@ def _data_freshness(latest_market_ts: str | None) -> tuple[str, str | None]:
 
 
 def _scanner_sort_key(row: MarketScannerRow) -> tuple[int, float, float, float, str]:
-    pri = {"STRONG_BUY": 0, "WEAK_BUY": 1, "NO_TRADE": 2}
-    return (
-        pri.get(str(row.trade_decision).upper(), 3),
-        -float(row.confidence_score),
-        -float(row.expected_move_pct),
-        -float(row.combined_agreement_score),
-        str(row.coin),
+    return (-float(row.market_score), -float(row.confidence_score), str(row.coin))
+
+
+def _compute_market_score(
+    *,
+    confidence_score: float,
+    combined_agreement_score: float,
+    expected_move_pct: float,
+    signal_strength_score: float,
+) -> float:
+    move_component = min(1.0, max(0.0, float(expected_move_pct)) / 0.08)
+    score = (
+        0.35 * max(0.0, min(1.0, float(confidence_score)))
+        + 0.30 * max(0.0, min(1.0, float(combined_agreement_score)))
+        + 0.20 * move_component
+        + 0.15 * max(0.0, min(1.0, float(signal_strength_score)))
     )
+    return float(max(0.0, min(1.0, round(score, 4))))
 
 
 class ForecastPathResponse(BaseModel):
@@ -382,7 +394,7 @@ class ForecastPathResponse(BaseModel):
     trade_signal: str = Field("NO_TRADE", description="BUY | SELL | NO_TRADE (legacy decision filter)")
     trade_decision: str = Field(
         "NO_TRADE",
-        description="Strict engine: STRONG_BUY | WEAK_BUY | NO_TRADE",
+        description="Strict engine: STRONG_BUY | WEAK_BUY | PROBING_BUY | NO_TRADE",
     )
     trade_reasons: list[str] = Field(
         default_factory=list,
@@ -837,6 +849,13 @@ def create_app() -> FastAPI:
                 "step0_raw_logret_by_model": diag.get("step0_raw_logret_by_model") or {},
                 "model_horizon_variance_raw": diag.get("model_horizon_variance_raw") or {},
                 "agreement_diagnostics": diag.get("agreement_diagnostics") or {},
+                "decision_blockers": diag.get("decision_blockers") or {},
+                "decision_summary": diag.get("decision_summary") or {},
+                "base_confidence": float(diag.get("base_confidence", 0.0)),
+                "risk_adjusted_confidence": float(diag.get("risk_adjusted_confidence", 0.0)),
+                "decision_confidence": float(diag.get("decision_confidence", 0.0)),
+                "filtered_ensemble_prediction": diag.get("filtered_ensemble_prediction"),
+                "excluded_model_name": diag.get("excluded_model_name"),
                 "max_missing_feature_fill_ratio": float(diag.get("max_missing_feature_fill_ratio", 0.0)),
                 "twitter_sentiment_used": bool(diag.get("twitter_sentiment_used", False)),
                 "sentiment_alignment": float(diag.get("sentiment_alignment", 0.0)),
@@ -877,7 +896,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/predictions/all", response_model=list[MarketScannerRow])
     def predictions_all() -> list[MarketScannerRow]:
-        """Compact scanner rows for all supported coins, sorted by trade priority."""
+        """Compact scanner rows for all supported coins, sorted by market opportunity score."""
         features_dir = settings.training.features_dir
         rows: list[MarketScannerRow] = []
         for coin in get_supported_coins_list():
@@ -889,6 +908,12 @@ def create_app() -> FastAPI:
             if not result:
                 continue
             diag = result.get("_forecast_diagnostics") or {}
+            market_score = _compute_market_score(
+                confidence_score=float(diag.get("confidence_score") or 0.0),
+                combined_agreement_score=float(diag.get("combined_agreement_score") or 0.0),
+                expected_move_pct=float(diag.get("expected_move_pct") or 0.0),
+                signal_strength_score=float(diag.get("signal_strength_score") or 0.0),
+            )
             rows.append(
                 MarketScannerRow(
                     coin=str(result.get("coin") or coin),
@@ -900,9 +925,12 @@ def create_app() -> FastAPI:
                     volatility_regime=str(diag.get("volatility_regime") or "UNKNOWN"),
                     signal_strength_score=float(diag.get("signal_strength_score") or 0.0),
                     directional_probabilities=dict(diag.get("directional_probabilities") or {}),
+                    market_score=market_score,
                 )
             )
         rows.sort(key=_scanner_sort_key)
+        for i, row in enumerate(rows[:3], start=1):
+            row.top_opportunity_rank = i
         return rows
 
     # Dashboard (defined before mount so it takes precedence)

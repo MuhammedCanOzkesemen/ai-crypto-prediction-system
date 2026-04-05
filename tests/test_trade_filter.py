@@ -103,6 +103,32 @@ class TestTradeFilter(unittest.TestCase):
         )
         self.assertNotEqual(r["decision"], "STRONG_BUY")
 
+    def test_probing_buy_and_blockers(self) -> None:
+        r = evaluate_trade_opportunity(
+            {
+                "confidence_score": 0.34,
+                "base_confidence": 0.38,
+                "risk_adjusted_confidence": 0.28,
+                "mean_path_agreement": 0.49,
+                "combined_agreement_score": 0.5,
+                "agreement_trend_score": 0.6,
+                "agreement_trend_label": "stable",
+                "signal_strength_score": 0.33,
+                "directional_probabilities": {"up": 0.54, "down": 0.24, "neutral": 0.22},
+                "directional_confidence": 0.54,
+                "volatility_regime": "LOW",
+                "expected_move_pct": 0.03,
+                "risk_reward_ratio": 1.1,
+                "trend_label": "UP",
+                "forecast_bullish": True,
+                "volatility_shock_detected": False,
+                "market_regime": "TRENDING",
+            }
+        )
+        self.assertEqual(r["decision"], "PROBING_BUY")
+        self.assertIn("decision_blockers", r)
+        self.assertFalse(r["decision_blockers"]["directional"])
+
 
 if __name__ == "__main__":
     unittest.main()

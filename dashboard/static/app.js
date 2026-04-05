@@ -70,6 +70,8 @@
     rows
       .slice()
       .sort(function (a, b) {
+        var ms = (b.market_score || 0) - (a.market_score || 0);
+        if (Math.abs(ms) > 1e-9) return ms;
         var p = decisionPriority(a.trade_decision) - decisionPriority(b.trade_decision);
         if (p !== 0) return p;
         return (b.confidence_score || 0) - (a.confidence_score || 0);
@@ -95,8 +97,12 @@
           moveTag = '<span class="scanner-tag">Top move</span>';
         }
 
+        var coinLabel = (row.coin || '—');
+        if (row.top_opportunity_rank) {
+          coinLabel += ' <span class="scanner-tag">Top ' + row.top_opportunity_rank + '</span>';
+        }
         tr.innerHTML =
-          '<td>' + (row.coin || '—') + '</td>' +
+          '<td>' + coinLabel + '</td>' +
           '<td><span class="scanner-decision ' +
             (decision === 'STRONG_BUY' ? 'strong' : decision === 'WEAK_BUY' ? 'weak' : 'none') +
             '">' + decision.replace(/_/g, ' ') + '</span></td>' +

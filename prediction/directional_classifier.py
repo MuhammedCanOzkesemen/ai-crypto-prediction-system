@@ -231,6 +231,40 @@ def regression_agreement_with_diagnostics(
     }
 
 
+def agreement_trend_summary(agreements: list[float] | None) -> dict[str, Any]:
+    """Agreement quality across the forecast horizon: stable/improving/collapsing."""
+    if not agreements:
+        return {"score": 0.5, "label": "mixed", "slope": 0.0, "stability": 0.5}
+    arr = np.asarray([float(x) for x in agreements], dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return {"score": 0.5, "label": "mixed", "slope": 0.0, "stability": 0.5}
+    if len(arr) == 1:
+        v = float(max(0.0, min(1.0, arr[0])))
+        return {"score": round(v, 4), "label": "stable", "slope": 0.0, "stability": round(v, 4)}
+    slope = float(arr[-1] - arr[0])
+    std = float(np.std(arr))
+    mean_level = float(np.mean(arr))
+    stability = float(max(0.0, min(1.0, 1.0 - min(1.0, std / 0.18))))
+    slope_n = float(max(-1.0, min(1.0, slope / 0.18)))
+    trend_signal = 0.5 + 0.5 * slope_n
+    score = float(max(0.0, min(1.0, 0.5 * stability + 0.3 * trend_signal + 0.2 * mean_level)))
+    if slope <= -0.10 or (arr[-1] < mean_level - 0.08 and std > 0.06):
+        label = "collapsing"
+    elif slope >= 0.08:
+        label = "improving"
+    elif stability >= 0.72:
+        label = "stable"
+    else:
+        label = "mixed"
+    return {
+        "score": round(score, 4),
+        "label": label,
+        "slope": round(slope, 4),
+        "stability": round(stability, 4),
+    }
+
+
 def combined_agreement_score(regression_agreement: float, directional_model_agreement: float) -> float:
     """Blend robust path agreement with directional-model agreement."""
     ra = float(max(0.0, min(1.0, regression_agreement)))

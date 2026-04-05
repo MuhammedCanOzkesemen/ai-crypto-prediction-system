@@ -72,7 +72,7 @@ def cumulative_scale_returns(
     factor = cap / abs(s)
     scaled = [float(r) * factor for r in returns]
     logger.warning(
-        "Realism guardrail: scaled cumulative log-return (|sum| %.4f → cap %.4f)",
+        "Realism guardrail: scaled cumulative log-return (|sum| %.4f -> cap %.4f)",
         abs(s),
         cap,
     )

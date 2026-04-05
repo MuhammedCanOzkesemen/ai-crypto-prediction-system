@@ -11,13 +11,18 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 import pandas as pd
 
 from evaluation.ablation import run_ablation_study
-from evaluation.trade_backtest import backtests_dir, run_trade_backtest
+from evaluation.trade_backtest import (
+    backtests_dir,
+    compare_live_and_backtest_prediction,
+    run_trade_backtest,
+)
 from utils.config import settings
 from utils.constants import SUPPORTED_COINS
 from utils.logging_setup import configure_root_logger, get_logger
@@ -39,6 +44,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--all", action="store_true", help="Run every supported coin with data + models")
     p.add_argument("--start", type=str, default=None, help="YYYY-MM-DD (default: first valid date in parquet)")
     p.add_argument("--end", type=str, default=None, help="YYYY-MM-DD (default: last date in parquet)")
+    p.add_argument(
+        "--compare-date",
+        type=str,
+        default=None,
+        help="YYYY-MM-DD parity check between live-style and backtest-style prediction on that date",
+    )
     p.add_argument("--ablation", action="store_true", help="Run ablation grid (A–F) for each selected coin")
     p.add_argument("--no-twitter", action="store_true")
     p.add_argument("--no-regime", action="store_true")
@@ -87,6 +98,19 @@ def main() -> int:
         ds, de = _default_dates(coin)
         start = args.start or ds
         end = args.end or de
+
+        if args.compare_date:
+            cmp_res = compare_live_and_backtest_prediction(
+                coin,
+                args.compare_date,
+                decision_mode=args.decision_mode,
+                include_twitter=not args.no_twitter,
+                include_regime_filter=not args.no_regime,
+                include_cooldown=not args.no_cooldown,
+            )
+            logger.info("%s parity %s", coin, "OK" if cmp_res.get("matches") else "MISMATCH")
+            print(json.dumps(cmp_res, indent=2, default=str))
+            continue
 
         if args.ablation:
             rows, ab_path = run_ablation_study(coin, start, end)

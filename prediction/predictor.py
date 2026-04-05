@@ -7,8 +7,10 @@ recomputing features. No synthetic path smoothing or output inertia.
 
 from __future__ import annotations
 
+import copy
 import math
 import os
+import time as time_mod
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,7 @@ from prediction.directional_classifier import (
     compute_hybrid_primary_confidence,
     directional_confidence_from_probs,
     directional_distribution_agreement,
+    agreement_trend_summary,
     merge_directional_probabilities,
     proba_dict_from_sklearn_row,
     regression_agreement_with_diagnostics,
@@ -87,6 +90,8 @@ from utils.logging_setup import get_logger
 logger = get_logger(__name__)
 
 HORIZON_DAYS = DEFAULT_HORIZON
+FEATURE_CACHE_TTL_SEC = 60.0
+LIVE_RESULT_CACHE_TTL_SEC = 20.0
 
 
 def _model_agreement_score(predictions: list[float]) -> float:
@@ -130,6 +135,8 @@ class Predictor:
         )
         self._loaded: dict[str, dict[str, Any]] = {}
         self._last_forecast_error: dict[str, Any] | None = None
+        self._feature_frame_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._live_result_cache: dict[tuple[str, str], dict[str, Any]] = {}
 
     def get_last_forecast_error(self) -> dict[str, Any] | None:
         """Structured failure from the last predict_from_latest_features (if any)."""
@@ -139,6 +146,60 @@ class Predictor:
         """Only the regression ensemble members used for price forecasting."""
         loaded = self._loaded.get(coin) or {}
         return {name: loaded[name] for name in list_models() if name in loaded}
+
+    def _cache_key(self, coin: str, features_dir: Path) -> tuple[str, str]:
+        return (str(coin), str(Path(features_dir).resolve()))
+
+    def _get_cached_feature_frame(self, coin: str, features_dir: Path) -> pd.DataFrame | None:
+        entry = self._feature_frame_cache.get(self._cache_key(coin, features_dir))
+        if not entry or float(entry.get("expires_at", 0.0)) < time_mod.monotonic():
+            return None
+        df = entry.get("df")
+        return df.copy() if isinstance(df, pd.DataFrame) else None
+
+    def _set_cached_feature_frame(self, coin: str, features_dir: Path, df: pd.DataFrame) -> None:
+        self._feature_frame_cache[self._cache_key(coin, features_dir)] = {
+            "expires_at": time_mod.monotonic() + FEATURE_CACHE_TTL_SEC,
+            "df": df.copy(),
+        }
+
+    def _get_cached_live_result(self, coin: str, features_dir: Path) -> dict[str, Any] | None:
+        entry = self._live_result_cache.get(self._cache_key(coin, features_dir))
+        if not entry or float(entry.get("expires_at", 0.0)) < time_mod.monotonic():
+            return None
+        result = entry.get("result")
+        return copy.deepcopy(result) if isinstance(result, dict) else None
+
+    def _set_cached_live_result(self, coin: str, features_dir: Path, result: dict[str, Any]) -> None:
+        self._live_result_cache[self._cache_key(coin, features_dir)] = {
+            "expires_at": time_mod.monotonic() + LIVE_RESULT_CACHE_TTL_SEC,
+            "result": copy.deepcopy(result),
+        }
+
+    def _filtered_ensemble_prediction(
+        self,
+        current_close: float,
+        path_rows: list[dict[str, Any]],
+        weights: dict[str, float],
+        excluded_model_name: str | None,
+    ) -> float | None:
+        """Rebuild a filtered ensemble final price excluding one diverging model."""
+        if not excluded_model_name or current_close <= 0 or not path_rows:
+            return None
+        price = float(current_close)
+        for row in path_rows:
+            mlr = row.get("model_log_returns") or {}
+            kept = {k: float(v) for k, v in mlr.items() if k != excluded_model_name}
+            if len(kept) < 2:
+                return None
+            w_eff = {k: float(weights.get(k, 0.0)) for k in kept}
+            w_sum = sum(w_eff.values())
+            if w_sum <= 1e-12:
+                r = float(np.mean(list(kept.values())))
+            else:
+                r = float(sum((w_eff[k] / w_sum) * kept[k] for k in kept))
+            price *= math.exp(r)
+        return float(price)
 
     def load_models(self, coin: str) -> bool:
         coin_dir = self.models_dir / coin.replace(" ", "_")
@@ -659,6 +720,7 @@ class Predictor:
             lr_matrix,
             model_order,
         )
+        agreement_trend = agreement_trend_summary(agreements)
         chaotic, chaos_frac = lr_matrix_chaotic_disagreement(lr_matrix)
         stability_score = compute_path_stability_score(path_raw)
         forecast_bullish = float(last["predicted_price"]) > current_close
@@ -692,16 +754,48 @@ class Predictor:
             ema_s, ema_l, adx5, forecast_bullish=forecast_bullish
         )
 
+        excluded_model_name: str | None = None
+        filtered_final_prediction: float | None = None
+        div_name = agreement_diag.get("diverging_model") if isinstance(agreement_diag, dict) else None
+        div_score = float((agreement_diag or {}).get("diverging_model_score", 0.0))
+        per_model_div = (agreement_diag or {}).get("per_model_divergence") or {}
+        div_vals = sorted(
+            [float(v) for v in per_model_div.values() if isinstance(v, (int, float))],
+            reverse=True,
+        )
+        second_div = float(div_vals[1]) if len(div_vals) >= 2 else 0.0
+        if (
+            isinstance(div_name, str)
+            and div_name
+            and len(model_order) >= 3
+            and div_score >= 0.56
+            and (div_score - second_div >= 0.05 or div_score >= 0.66)
+        ):
+            filtered_final_prediction = self._filtered_ensemble_prediction(
+                current_close,
+                path_raw,
+                weights,
+                div_name,
+            )
+            if filtered_final_prediction is not None and math.isfinite(filtered_final_prediction):
+                excluded_model_name = div_name
+
+        decision_final_prediction = (
+            float(filtered_final_prediction)
+            if filtered_final_prediction is not None and math.isfinite(filtered_final_prediction)
+            else float(last["predicted_price"])
+        )
+
         implied_ret = (
-            (float(last["predicted_price"]) - current_close) / current_close
+            (float(decision_final_prediction) - current_close) / current_close
             if current_close > 0
             else 0.0
         )
         implied_lr = math.log(
-            max(float(last["predicted_price"]), 1e-30) / max(current_close, 1e-30)
+            max(float(decision_final_prediction), 1e-30) / max(current_close, 1e-30)
         )
         sig_strength = compute_signal_strength_score(
-            current_close, float(last["predicted_price"]), feature_context
+            current_close, float(decision_final_prediction), feature_context
         )
         sig_strength = blend_signal_strength_with_twitter(
             sig_strength,
@@ -736,11 +830,20 @@ class Predictor:
             **(agreement_diag or {}),
             "raw_mean_path_agreement": round(float(mean_agree), 4),
             "directional_model_agreement": round(float(dir_model_agree), 4),
+            "agreement_trend": agreement_trend,
         }
         merged["combined_agreement_score"] = round(
             float(combine_reg_dir_agreement(float(regression_agree), dir_model_agree)), 4
         )
+        merged["agreement_trend_score"] = float((agreement_trend or {}).get("score", 0.5))
+        merged["agreement_trend_label"] = str((agreement_trend or {}).get("label", "mixed"))
         merged["signal_strength_score"] = round(max(0.0, float(sig_strength)), 4)
+        merged["filtered_ensemble_prediction"] = (
+            round_price_for_display(float(filtered_final_prediction), current_close)
+            if filtered_final_prediction is not None and math.isfinite(filtered_final_prediction)
+            else None
+        )
+        merged["excluded_model_name"] = excluded_model_name
         merged["volatility_regime"] = infer_volatility_regime_from_context(feature_context)
         merged["stability_score"] = float(stability_score)
         merged["consensus_score"] = float(consensus_score)
@@ -814,6 +917,7 @@ class Predictor:
             apply_confidence_penalty_caps(hybrid_raw, merged),
             vol_regime=str(merged.get("volatility_regime") or "MEDIUM"),
         )
+        merged["base_confidence"] = round(float(base_confidence), 4)
         merged["confidence_score_base"] = round(float(base_confidence), 4)
         vr_compose = str(merged.get("volatility_regime") or "MEDIUM")
         risk_adj_base = compose_light_risk_adjusted_confidence(
@@ -823,13 +927,16 @@ class Predictor:
             chaotic_disagreement=chaotic,
             market_regime=regime_trade,
         )
+        decision_confidence = 0.6 * float(base_confidence) + 0.4 * float(risk_adj_base)
+        merged["risk_adjusted_confidence"] = round(float(risk_adj_base), 4)
         merged["confidence_score_pre_decision_layer"] = round(float(risk_adj_base), 4)
+        merged["decision_confidence"] = round(float(decision_confidence), 4)
         dec = compute_decision_bundle(
             current_price=current_close,
-            final_prediction=float(last["predicted_price"]),
+            final_prediction=float(decision_final_prediction),
             lower_bound=float(last["lower_bound"]),
             upper_bound=float(last["upper_bound"]),
-            base_confidence=float(risk_adj_base),
+            base_confidence=float(decision_confidence),
             mean_path_agreement=effective_agree,
             signal_strength_score=float(sig_strength),
             trend_label=str(trend_for_hc),
@@ -863,7 +970,9 @@ class Predictor:
 
         if strict_trade_filter:
             trade_eval = evaluate_trade_opportunity({
-                "confidence_score": float(merged.get("confidence_score_pre_decision_layer") or merged["confidence_score"]),
+                "confidence_score": float(merged.get("decision_confidence") or merged["confidence_score"]),
+                "base_confidence": float(merged.get("base_confidence") or base_confidence),
+                "risk_adjusted_confidence": float(merged.get("risk_adjusted_confidence") or risk_adj_base),
                 "mean_path_agreement": float(effective_agree),
                 "combined_agreement_score": float(merged.get("combined_agreement_score") or effective_agree),
                 "directional_confidence": float(merged.get("directional_confidence") or 0.0),
@@ -884,6 +993,8 @@ class Predictor:
                 "signal_cooldown_active": bool(cooldown_block),
                 "market_regime": regime_trade,
                 "market_regime_confidence": float(regime_conf_trade),
+                "agreement_trend_score": float(merged.get("agreement_trend_score") or 0.5),
+                "agreement_trend_label": str(merged.get("agreement_trend_label") or "mixed"),
             })
         else:
             tsig = str(dec.get("trade_signal", "NO_TRADE"))
@@ -899,6 +1010,8 @@ class Predictor:
         merged["trade_decision"] = str(trade_eval["decision"])
         merged["edge_score"] = float(trade_eval["score"])
         merged["trade_reasons"] = list(trade_eval["reasons"])
+        merged["decision_blockers"] = dict(trade_eval.get("decision_blockers") or {})
+        merged["decision_summary"] = dict(trade_eval.get("decision_summary") or {})
         merged["strict_trade_filter_applied"] = bool(strict_trade_filter)
         if register_signal_cooldown:
             cd_days = int(os.environ.get("TRADE_COOLDOWN_DAYS", "3"))
@@ -933,26 +1046,32 @@ class Predictor:
         """
         self._last_forecast_error = None
         features_dir = Path(features_dir) if features_dir else settings.training.features_dir
-        refresh_data_if_needed(coin, features_dir=features_dir)
         path = features_dir / f"{coin.replace(' ', '_')}_features.parquet"
-        if not path.exists():
-            logger.warning("Feature file not found: %s", path)
-            self._last_forecast_error = {
-                "code": "no_feature_file",
-                "message": f"Feature parquet not found: {path.name}",
-                "hint": "Run training pipeline or POST /api/refresh/{coin} to build features.",
-            }
-            return None
-        try:
-            df = pd.read_parquet(path)
-        except Exception as e:
-            logger.exception("Failed to load features for %s: %s", coin, e)
-            self._last_forecast_error = {
-                "code": "feature_load_failed",
-                "message": str(e),
-                "hint": "Check that the parquet file is readable and not corrupted.",
-            }
-            return None
+        cached_result = self._get_cached_live_result(coin, features_dir)
+        if cached_result is not None:
+            return cached_result
+        df = self._get_cached_feature_frame(coin, features_dir)
+        if df is None:
+            refresh_data_if_needed(coin, features_dir=features_dir)
+            if not path.exists():
+                logger.warning("Feature file not found: %s", path)
+                self._last_forecast_error = {
+                    "code": "no_feature_file",
+                    "message": f"Feature parquet not found: {path.name}",
+                    "hint": "Run training pipeline or POST /api/refresh/{coin} to build features.",
+                }
+                return None
+            try:
+                df = pd.read_parquet(path)
+            except Exception as e:
+                logger.exception("Failed to load features for %s: %s", coin, e)
+                self._last_forecast_error = {
+                    "code": "feature_load_failed",
+                    "message": str(e),
+                    "hint": "Check that the parquet file is readable and not corrupted.",
+                }
+                return None
+            self._set_cached_feature_frame(coin, features_dir, df)
         if df.empty or len(df) < 80:
             logger.warning("Insufficient history for %s", coin)
             self._last_forecast_error = {
@@ -971,7 +1090,7 @@ class Predictor:
             }
             return None
 
-        return self._run_full_forecast_pipeline(
+        result = self._run_full_forecast_pipeline(
             coin,
             df,
             include_twitter=True,
@@ -981,6 +1100,9 @@ class Predictor:
             strict_trade_filter=True,
             decision_gate_multiplier=1.0,
         )
+        if result is not None:
+            self._set_cached_live_result(coin, features_dir, result)
+        return result
 
     def predict_for_backtest(
         self,
@@ -1285,6 +1407,13 @@ class Predictor:
                 "step0_raw_logret_by_model": diag.get("step0_raw_logret_by_model") or {},
                 "model_horizon_variance_raw": diag.get("model_horizon_variance_raw") or {},
                 "agreement_diagnostics": diag.get("agreement_diagnostics") or {},
+                "decision_blockers": diag.get("decision_blockers") or {},
+                "decision_summary": diag.get("decision_summary") or {},
+                "base_confidence": float(diag.get("base_confidence", 0.0)),
+                "risk_adjusted_confidence": float(diag.get("risk_adjusted_confidence", 0.0)),
+                "decision_confidence": float(diag.get("decision_confidence", 0.0)),
+                "filtered_ensemble_prediction": diag.get("filtered_ensemble_prediction"),
+                "excluded_model_name": diag.get("excluded_model_name"),
                 "ensemble_log_return_var": float(diag.get("ensemble_log_return_var", 0.0)),
                 "price_relative_variance": float(diag.get("price_relative_variance", 0.0)),
                 "max_missing_feature_fill_ratio": float(diag.get("max_missing_feature_fill_ratio", 0.0)),
