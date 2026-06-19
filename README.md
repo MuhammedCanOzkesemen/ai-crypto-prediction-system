@@ -198,3 +198,6 @@ See **ARCHITECTURE.md** for assumptions (daily bars, stop-first rule when both l
 ## License
 
 See repository **LICENSE** (e.g. MIT if stated in the project root).
+
+
+Author: Muhammed Can Özkesemen
